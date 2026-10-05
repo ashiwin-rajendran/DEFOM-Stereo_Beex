@@ -1,0 +1,129 @@
+# Distil defomstereo_vitl_sceneflow's encoder into a small student.
+#
+# Measured on this setup:
+#   teacher encoder (DepthAnythingV2-L)  1463.7 MB
+#   student at width 1.0                    8.9 MB
+#   reused stereo core (fnet/cnet/GRU)     66.8 MB
+#   deployed model                       ~ 75.6 MB   (vs 1530.5 vitl, 173.2 vits)
+
+run_name: underwater_vitl_to_student
+description: >
+  DEFOM-Stereo encoder distillation on explore3d underwater stereo.
+  No labels required: the student regresses the frozen teacher's encoder
+  outputs, so any footage from the deployment domain is valid training data.
+
+paths:
+  # Produced by distillation/capture_stereo.py
+  image_dir: distillation/datasets/underwater
+  teacher_ckpt: checkpoints/defomstereo_vitl_sceneflow.pth
+  checkpoint_dir: distillation/checkpoints/underwater_vitl_to_student
+  init_from: ""
+  resume_from: ""
+
+training:
+  epochs: 50
+  # Each sample puts TWO images (left+right) through the teacher at 532x700,
+  # so effective encoder batch is 2x this. Raise only if VRAM allows.
+  batch_size: 2
+  lr: 0.0003
+  min_lr: 0.000001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  num_workers: 4
+  seed: 17
+  checkpoint_every: 1
+  val_fraction: 0.05
+  # temporal | random. temporal holds out the LAST frames captured. Use it:
+  # consecutive survey frames are near-duplicates, so a random split puts
+  # near-copies of training frames into validation and reports a number that
+  # looks good while saying nothing about generalisation.
+  val_split: temporal
+  val_every: 1
+  # End-to-end validation runs the full model twice per frame, so keep it small.
+  val_max_frames: 24
+  amp: true
+  # Teacher batches sampled before training to measure each output's mean/std.
+  # The student's heads then learn a standardised target and denormalise on
+  # output -- without this the huge left/right targets (std ~20931) give
+  # gradients ~1e-4 and that term never trains.
+  calibration_batches: 8
+
+student:
+  # mbconv    self-contained, no dependency outside distillation/
+  # mobilevit reuses MobileViT-S from Yolo_Seg/vit_training/scripts -- the same
+  #           architecture as the DINOv3 distillation, so an existing
+  #           student_mobilevit_*.pth can warm-start it
+  #
+  #   mbconv  width 0.5 ->  4.8 MB   deployed ~71.6 MB
+  #   mbconv  width 1.0 ->  8.9 MB   deployed ~75.7 MB
+  #   mbconv  width 1.5 -> 15.5 MB   deployed ~82.3 MB
+  #   mobilevit-s       -> 27.2 MB   deployed ~94.0 MB
+  backbone: mobilevit
+  width: 1.0              # mbconv only
+  fpn_dim: 128
+  depth_dim: 64
+  mobilevit_variant: s          # s | xs | xxs
+  mobilevit_scripts_dir: ""     # blank = auto-locate Yolo_Seg/vit_training/scripts
+  # Warm start. Note those checkpoints were distilled from DINOv3 on sonar;
+  # this teacher is DINOv2 on RGB underwater, so transfer may be limited.
+  # group | batch. GroupNorm is default and strongly recommended: the teacher
+  # caps batch size near 2-4, and with BatchNorm at that size train() and
+  # eval() were measured to diverge 28-45% on real data -- meaning validation
+  # and deployment would run a different function than the one optimised.
+  norm: group
+  # Warm start from your DINOv3->MobileViT RGB distillation. Verified: loads
+  # 304/304 tensors into this backbone. The 6 "unexpected" are conv2
+  # (160->1024, the DINOv3 projection), which this head does not use -- it
+  # taps mvit[2] at 160ch upstream, so conv2 is replaced by Identity.
+  #
+  # Use the .pth, NOT the .pt in the same folder: the .pt is a TorchScript
+  # export and is not a state dict (the loader will tell you so).
+  #
+  # That run was input_mode: rgb at 512x512 from DINOv3 ViT-L/16 -- same
+  # modality as this camera, though a different teacher and a different
+  # target. Blank it out to train the backbone from scratch instead.
+  mobilevit_init_from: /mnt/BeeX-Ashwin/Vision_Tools/Online_Registration/Yolo_Seg/vit_training/weights/old/Distilled_Dinov3_RGB/checkpoints_512_from_448_stage2/student_mobilevit_2M_Dinov3_based_epoch0002.pth
+
+data:
+  height: 600
+  width: 800
+  swap_lr: false
+  photometric: true
+  brightness: 0.2
+  contrast: 0.2
+  # Mirrors BOTH views and swaps their order -- the only geometric transform
+  # that keeps a rectified stereo pair valid.
+  hflip_pair: true
+
+loss:
+  # Three d_features scales, then the fused left/right matching features.
+  w_dfeat: [1.0, 1.0, 1.0]
+  w_left: 1.0
+  w_right: 1.0
+  # idepth seeds the disparity field before the GRU refines it, so a bad prior
+  # costs iterations. Raise this if validation shows good features but the
+  # student converges to a visibly different disparity.
+  w_idepth: 1.0
+  # relative_mse divides each term by the teacher's own energy. Required:
+  # the teacher's outputs span five orders of magnitude (left/right std
+  # ~20931 vs d_features std ~94-281), so raw mse makes the left/right term
+  # ~10000x larger than everything else and the student ignores the rest.
+  feature_metric: relative_mse   # relative_mse | mse | cosine
+
+arch:
+  # MUST match the teacher checkpoint.
+  dinov2_encoder: vitl
+  idepth_scale: 0.5
+  hidden_dims: [128, 128, 128]
+  corr_implementation: reg
+  corr_levels: 2
+  corr_radius: 4
+  scale_list: [0.125, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+  scale_corr_radius: 2
+  n_downsample: 2
+  context_norm: batch
+  n_gru_layers: 3
+  shared_backbone: false
+  mixed_precision: false
+  valid_iters: 32
+  scale_iters: 8
