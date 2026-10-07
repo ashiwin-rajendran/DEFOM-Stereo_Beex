@@ -1,2 +1,10 @@
 checkpoints/
 distillation/datasets/
+distillation/checkpoints/
+__pycache__/
+core/__pycache__/
+core/utils/__pycache__/
+depth_anything_v2/__pycache__/
+depth_anything_v2/dinov2_layers/__pycache__/
+depth_anything_v2/util/__pycache__/
+distillation/__pycache__/

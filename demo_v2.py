@@ -194,8 +194,7 @@ class DefomStereoNode(object):
         self.fx_baseline = None     # metres * pixels; the only quantity depth needs
         self.calib_note = ""
 
-        rospy.loginfo("Loading %s (%s) ...", args.restore_ckpt, args.dinov2_encoder)
-        self.model = build_model(args, self.device)
+        self.model = self._build_model()
         rospy.loginfo("Model ready, %.2f GB on GPU", torch.cuda.memory_allocated() / 1e9
                       if self.device.type == "cuda" else 0.0)
 
@@ -221,6 +220,14 @@ class DefomStereoNode(object):
 
         if args.warmup:
             self.warmup()
+
+    def _build_model(self):
+        """Separate from __init__ so a subclass can swap model construction
+        -- e.g. demo_v3.py loads a distilled student instead of the full
+        vitl/vits encoder -- without duplicating the publishers, calibration,
+        point-cloud TF machinery and main loop below, which stay identical."""
+        rospy.loginfo("Loading %s (%s) ...", self.args.restore_ckpt, self.args.dinov2_encoder)
+        return build_model(self.args, self.device)
 
     # ---------------------------------------------------- calibration
 
@@ -584,7 +591,7 @@ def parse_args(argv):
     pts.add_argument('--publish_points', action='store_true', default=True,
                      help='publish a PointCloud2 reprojected from metric depth')
     pts.add_argument('--no_points', dest='publish_points', action='store_false')
-    pts.add_argument('--points_frame_id', default='ikan/camera_link',
+    pts.add_argument('--points_frame_id', default='explore3d',
                      help='frame_id stamped on the cloud. Points are rotated into this frame using the '
                           'LIVE TF from the image frame (e.g. explore3d) -- looked up at runtime, never '
                           'assumed, since the mount is not a textbook optical<->body swap (measured: a '

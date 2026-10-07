@@ -15,8 +15,8 @@ description: >
 paths:
   # Produced by distillation/capture_stereo.py
   image_dir: distillation/datasets/underwater
-  teacher_ckpt: checkpoints/defomstereo_vitl_sceneflow.pth
-  checkpoint_dir: distillation/checkpoints/underwater_vitl_to_student
+  teacher_ckpt: checkpoints/defomstereo_vitl_middlebury.pth
+  checkpoint_dir: distillation/checkpoints/underwater_vitl_middlebury_to_student
   init_from: ""
   resume_from: ""
 
