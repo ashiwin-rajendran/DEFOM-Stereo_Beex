@@ -3,8 +3,8 @@
 vitl/vits encoder -- same stream, same topics, same math as demo_v2.py, just
 a ~75-95 MB encoder instead of 1530 MB.
 
-    python3 demo_v3.py                       # latest sceneflow-distilled student
-    python3 demo_v3.py --run middlebury      # latest middlebury-distilled student
+    python3 demo_v3.py                       # latest middlebury-distilled student
+    python3 demo_v3.py --run multiscale      # latest multi-scale (any camera) student
     python3 demo_v3.py --student_ckpt distillation/checkpoints/.../student_epoch0019.pth
 
 Two trained lines exist, named after the DEFOM-Stereo checkpoint each one's
@@ -12,6 +12,7 @@ student was distilled to match (see distillation/README.md):
 
     sceneflow   distillation/checkpoints/underwater_vitl_to_student/
     middlebury  distillation/checkpoints/underwater_vitl_middlebury_to_student/
+    multiscale  distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale/
 
 --run picks the directory and auto-resolves its highest-epoch student_epoch
 ####.pth -- no path to edit after every resume. --student_ckpt overrides with
@@ -55,20 +56,29 @@ from defom_student import build_student
 from demo_v2 import DefomStereoNode, COLORMAPS
 
 
+ROOT = Path(__file__).resolve().parent
+
 RUN_DIRS = {
     "sceneflow": "distillation/checkpoints/underwater_vitl_to_student",
     "middlebury": "distillation/checkpoints/underwater_vitl_middlebury_to_student",
+    "multiscale": "distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale",
 }
+
+
+def repo_path(path):
+    """Relative paths resolve against the repository root, not the cwd."""
+    path = Path(path)
+    return path if path.is_absolute() else ROOT / path
 
 
 def resolve_student_checkpoint(path):
     """A file is used as-is. A directory resolves to its highest-epoch
     student_epoch####.pth, so --run keeps working across resumes without
     anyone editing a flag."""
-    p = Path(path)
+    p = repo_path(path)
     if p.is_file():
         return p
-    candidates = sorted(Path(path).glob("student_epoch*.pth"),
+    candidates = sorted(p.glob("student_epoch*.pth"),
                         key=lambda f: int(re.search(r"(\d+)", f.stem).group(1)))
     if not candidates:
         raise FileNotFoundError("No student_epoch*.pth under %s" % path)
@@ -104,11 +114,13 @@ def load_student_model(student_ckpt_path, device):
     ck = torch.load(str(student_path), map_location=device)
 
     arch_args = argparse.Namespace(**ck["config"]["arch"])
-    teacher_ckpt = ck["config"]["paths"]["teacher_ckpt"]
+    teacher_ckpt = repo_path(ck["config"]["paths"]["teacher_ckpt"])
     rospy.loginfo("Stereo core + calibration target: %s (as recorded in the checkpoint)", teacher_ckpt)
 
     model = DEFOMStereo(arch_args)
-    teacher_state = torch.load(teacher_ckpt, map_location=device)
+    # Loaded on the CPU: only the final ~94 MB model goes to the GPU, not the
+    # 1.5 GB teacher checkpoint as well.
+    teacher_state = torch.load(str(teacher_ckpt), map_location="cpu")
     model.load_state_dict(teacher_state["model"] if "model" in teacher_state else teacher_state)
 
     # mobilevit_init_from in student_cfg is the ORIGINAL training-time warm
@@ -144,7 +156,7 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
 
-    parser.add_argument('--run', default='sceneflow', choices=sorted(RUN_DIRS),
+    parser.add_argument('--run', default='middlebury', choices=sorted(RUN_DIRS),
                         help='which distilled line to load the latest checkpoint from. '
                              'Overridden by --student_ckpt if given.')
     parser.add_argument('--student_ckpt', default=None,
