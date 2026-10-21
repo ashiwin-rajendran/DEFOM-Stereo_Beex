@@ -7,17 +7,10 @@ from core.corr import CorrBlock1D, PytorchAlternateCorrBlock1D, CorrBlockFast1D,
 from core.utils.utils import coords_grid, upflow, get_danv2_io_size
 
 
-try:
-    autocast = torch.cuda.amp.autocast
-except:
-    # dummy autocast for PyTorch < 1.6
-    class autocast:
-        def __init__(self, enabled):
-            pass
-        def __enter__(self):
-            pass
-        def __exit__(self, *args):
-            pass
+def autocast(enabled):
+    # torch.autocast("cuda") is what the deprecated torch.cuda.amp.autocast
+    # now wraps; same behaviour, no FutureWarning.
+    return torch.autocast("cuda", enabled=enabled)
 
 
 class DEFOMStereo(nn.Module):

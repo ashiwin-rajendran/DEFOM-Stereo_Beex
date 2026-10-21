@@ -184,7 +184,7 @@ class MobileViTBackbone(nn.Module):
         head taps mvit[2] at 160 channels upstream of it, so it is replaced
         with Identity in __init__.
         """
-        blob = torch.load(path, map_location="cpu")
+        blob = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(blob, dict):
             raise TypeError(
                 "%s is a %s, not a state dict. The .pt files in these checkpoint folders are "

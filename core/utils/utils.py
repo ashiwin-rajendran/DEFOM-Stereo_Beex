@@ -105,7 +105,7 @@ def bilinear_sampler(img, coords, mode='bilinear', mask=False):
 
 
 def coords_grid(batch, ht, wd):
-    coords = torch.meshgrid(torch.arange(ht), torch.arange(wd))
+    coords = torch.meshgrid(torch.arange(ht), torch.arange(wd), indexing="ij")
     coords = torch.stack(coords[::-1], dim=0).float()
     return coords[None].repeat(batch, 1, 1, 1)
 
@@ -120,7 +120,7 @@ def upflow(flow, factor=8, mode='bilinear', sacle=True):
 
 def gauss_blur(input, N=5, std=1):
     B, D, H, W = input.shape
-    x, y = torch.meshgrid(torch.arange(N).float() - N//2, torch.arange(N).float() - N//2)
+    x, y = torch.meshgrid(torch.arange(N).float() - N//2, torch.arange(N).float() - N//2, indexing="ij")
     unnormalized_gaussian = torch.exp(-(x.pow(2) + y.pow(2)) / (2 * std ** 2))
     weights = unnormalized_gaussian / unnormalized_gaussian.sum().clamp(min=1e-4)
     weights = weights.view(1, 1, N, N).to(input)

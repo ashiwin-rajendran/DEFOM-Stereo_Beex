@@ -2,7 +2,10 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.models.layers import DropPath
+try:
+    from timm.layers import DropPath          # timm >= 0.9
+except ImportError:
+    from timm.models.layers import DropPath   # older timm (e.g. JetPack 5 envs)
 
 from depth_anything_v2.dpt import DepthAnythingV2
 

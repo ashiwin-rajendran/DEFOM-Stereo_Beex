@@ -140,6 +140,11 @@ def default_config():
             # epochs on a 4070) for a 1-3% perturbation of the targets. Off by
             # default; ignored on GPUs without bf16 (e.g. Xavier).
             "teacher_bf16": False,
+            # TF32 tensor cores for fp32 matmuls (teacher, validation).
+            # Measured on a 4070: teacher 450 -> 334 ms with target error
+            # unchanged (0.18% -> 0.19% vs strict fp32; PyTorch already uses
+            # TF32 for convolutions by default). Needs Ampere or newer.
+            "tf32": True,
         },
         "student": {
             "backbone": "mbconv",          # mbconv | mobilevit
@@ -409,7 +414,7 @@ def discover_images(image_dir):
 def build_teacher(cfg, device):
     model = DEFOMStereo(arch_namespace(cfg))
     ckpt_path = Path(cfg["paths"]["teacher_ckpt"])
-    checkpoint = torch.load(str(ckpt_path), map_location="cpu")
+    checkpoint = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["model"] if "model" in checkpoint else checkpoint)
     model.to(device).eval()
     for param in model.parameters():
@@ -723,7 +728,7 @@ def train(cfg):
 
     start_epoch = 0
     if cfg["paths"]["init_from"]:
-        state = torch.load(cfg["paths"]["init_from"], map_location=device)
+        state = torch.load(cfg["paths"]["init_from"], map_location=device, weights_only=True)
         student.load_state_dict(state["student"] if "student" in state else state)
         print("Initialised student from %s" % cfg["paths"]["init_from"])
 
@@ -741,6 +746,9 @@ def train(cfg):
         recalibrate_batchnorm(student, loader, teacher_model, cfg["arch"]["n_downsample"], device,
                               cfg["training"]["bn_recalibration_batches"])
 
+    if cfg["training"]["tf32"]:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     teacher_bf16 = bool(cfg["training"]["teacher_bf16"])
     if teacher_bf16 and not (device.type == "cuda" and torch.cuda.is_bf16_supported()):
         print("training.teacher_bf16 ignored: this GPU has no bfloat16 support")
@@ -751,10 +759,14 @@ def train(cfg):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(1, cfg["training"]["epochs"] * max(1, len(loader))),
         eta_min=cfg["training"]["min_lr"])
-    scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg["training"]["amp"]) and device.type == "cuda")
+    amp_enabled = bool(cfg["training"]["amp"]) and device.type == "cuda"
+    # torch.amp.GradScaler where available (torch >= 2.3); older JetPack
+    # builds only have the torch.cuda.amp one.
+    scaler = (torch.amp.GradScaler("cuda", enabled=amp_enabled) if hasattr(torch.amp, "GradScaler")
+              else torch.cuda.amp.GradScaler(enabled=amp_enabled))
 
     if cfg["paths"]["resume_from"]:
-        state = torch.load(cfg["paths"]["resume_from"], map_location=device)
+        state = torch.load(cfg["paths"]["resume_from"], map_location=device, weights_only=True)
         student.load_state_dict(state["student"])
         start_epoch = int(state.get("epoch", 0)) + 1
         if "optimizer" in state:
@@ -779,13 +791,18 @@ def train(cfg):
         print("Resumed from %s at epoch %d" % (cfg["paths"]["resume_from"], start_epoch))
 
     n_downsample = cfg["arch"]["n_downsample"]
-    amp_enabled = bool(cfg["training"]["amp"]) and device.type == "cuda"
 
     for epoch in range(start_epoch, cfg["training"]["epochs"]):
         student.train()
         running = {}
         started = time.time()
+        # Time spent waiting for the DataLoader: if it is a large share of
+        # s/step, decoding/resizing (CPU) is the bottleneck, not the GPU --
+        # raise training.num_workers.
+        data_wait = 0.0
+        fetched = time.time()
         for step, (left, right) in enumerate(loader):
+            data_wait += time.time() - fetched
             left, right = left.to(device, non_blocking=True), right.to(device, non_blocking=True)
             x, oh, ow, _ = preprocess(teacher_model, left, right, n_downsample)
 
@@ -796,7 +813,7 @@ def train(cfg):
                                *(t.float() for t in teacher_out[1:]))
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
+            with torch.autocast("cuda", enabled=amp_enabled):
                 student_out = student(x, oh, ow)
                 loss, parts = distill_loss(student_out, teacher_out, cfg)
 
@@ -804,17 +821,23 @@ def train(cfg):
             if cfg["training"]["grad_clip"] > 0:
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(student.parameters(), cfg["training"]["grad_clip"])
+            scale = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            # Mixed precision skips the optimizer step (and lowers the scale)
+            # when gradients overflow, as in the first few steps; the schedule
+            # advances only on steps that actually updated the weights.
+            if scaler.get_scale() >= scale:
+                scheduler.step()
 
             for key, value in parts.items():
                 running[key] = running.get(key, 0.0) + value
             if (step + 1) % 20 == 0:
                 n = step + 1
-                print("  epoch %d  step %4d/%d  total %.4f  idepth %.4f  lr %.2e  (%.2f s/step)"
+                print("  epoch %d  step %4d/%d  total %.4f  idepth %.4f  lr %.2e  (%.2f s/step, %.2f s waiting for data)"
                       % (epoch, n, len(loader), running["total"] / n, running["idepth"] / n,
-                         scheduler.get_last_lr()[0], (time.time() - started) / n))
+                         scheduler.get_last_lr()[0], (time.time() - started) / n, data_wait / n))
+            fetched = time.time()
 
         n = max(1, len(loader))
         record = {"epoch": epoch, "lr": scheduler.get_last_lr()[0],
@@ -863,7 +886,7 @@ def train(cfg):
             # only the newest checkpoint keeps it: ~27 MB per older epoch
             # instead of ~82 MB.
             if previous_ckpt is not None and previous_ckpt.exists():
-                state = torch.load(str(previous_ckpt), map_location="cpu")
+                state = torch.load(str(previous_ckpt), map_location="cpu", weights_only=True)
                 state.pop("optimizer", None)
                 state.pop("scheduler", None)
                 torch.save(state, str(previous_ckpt))
