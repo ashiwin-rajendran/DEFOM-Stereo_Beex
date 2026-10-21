@@ -13,6 +13,13 @@ Defaults to the latest checkpoint under distillation/checkpoints/<run>/ --
 no need to edit the epoch number after every resume. Override with
 --student_ckpt to pin a specific one.
 
+The teacher (stereo core) and architecture are read from the student
+checkpoint, as demo_v3.py and the exporter do: the student was distilled
+against one specific core, and pairing it with another runs without error but
+measures the wrong model. Frames are resized to --long_side first (default
+640, as the deployed node runs), which also keeps the vitl teacher in memory
+on large streams such as Voyis 2816x2816.
+
 ONE model instance, not two: the student is swapped into the SAME DEFOMStereo
 object's defomencoder.depth_anything for its forward pass, then swapped back
 -- exactly the trick validate_disparity() uses during training. Running two
@@ -59,22 +66,29 @@ import rospy
 import torch
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 
+from core.defom_stereo import DEFOMStereo
 from core.utils.utils import InputPadder
-from demo_v2 import build_model, to_tensor, colorise, COLORMAPS
+from demo_v2 import to_tensor, colorise, COLORMAPS
 from defom_student import build_student
 
 
-DEFAULT_CKPT_DIR = "distillation/checkpoints/underwater_vitl_to_student"
+DEFAULT_CKPT_DIR = "distillation/checkpoints/underwater_vitl_middlebury_to_student"
+
+
+def repo_path(path):
+    """Relative paths resolve against the repository root, not the cwd."""
+    path = Path(path)
+    return path if path.is_absolute() else ROOT / path
 
 
 def resolve_student_checkpoint(path):
     """A file is used as-is. A directory resolves to its highest-epoch
     student_epoch####.pth -- so this keeps working across resumes without
     editing a flag every time."""
-    p = Path(path)
+    p = repo_path(path)
     if p.is_file():
         return p
-    candidates = sorted(Path(path).glob("student_epoch*.pth"),
+    candidates = sorted(p.glob("student_epoch*.pth"),
                         key=lambda f: int(re.search(r"(\d+)", f.stem).group(1)))
     if not candidates:
         raise FileNotFoundError("No student_epoch*.pth under %s" % path)
@@ -98,17 +112,29 @@ class LiveCompareNode(object):
         self.agreement = {"n": 0, "mean": 0.0, "median": 0.0, "p90": 0.0,
                           "w1": 0.0, "w2": 0.0, "w3": 0.0}
 
-        rospy.loginfo("Loading teacher: %s" % args.teacher_ckpt)
-        self.teacher_args = self._arch_namespace(args, "vitl")
-        self.teacher_args.restore_ckpt = args.teacher_ckpt
-        self.model = build_model(self.teacher_args, self.device)
+        student_path = resolve_student_checkpoint(args.student_ckpt)
+        rospy.loginfo("Loading student: %s" % student_path)
+        ck = torch.load(str(student_path), map_location="cpu")
+        if args.valid_iters is None:
+            args.valid_iters = ck["config"]["arch"]["valid_iters"]
+        if args.scale_iters is None:
+            args.scale_iters = ck["config"]["arch"]["scale_iters"]
+
+        teacher_ckpt = repo_path(args.teacher_ckpt or ck["config"]["paths"]["teacher_ckpt"])
+        rospy.loginfo("Loading teacher (the student's own stereo core): %s" % teacher_ckpt)
+        arch = argparse.Namespace(**dict(ck["config"]["arch"], mixed_precision=args.mixed_precision))
+        self.model = DEFOMStereo(arch)
+        state = torch.load(str(teacher_ckpt), map_location="cpu")
+        self.model.load_state_dict(state["model"] if "model" in state else state)
+        del state
+        self.model.to(self.device).eval()
         self.teacher_encoder = self.model.defomencoder.depth_anything
         rospy.loginfo("Teacher ready, %.2f GB" % (torch.cuda.memory_allocated() / 1e9))
 
-        student_path = resolve_student_checkpoint(args.student_ckpt)
-        rospy.loginfo("Loading student: %s" % student_path)
-        ck = torch.load(str(student_path), map_location=self.device)
-        self.student = build_student(features=ck["out_dim"], **ck["student_cfg"]).to(self.device)
+        # The warm-start path in student_cfg is irrelevant (every weight comes
+        # from ck["student"]) and may not exist on this machine.
+        student_cfg = dict(ck["student_cfg"], mobilevit_init_from="")
+        self.student = build_student(features=ck["out_dim"], **student_cfg).to(self.device)
         self.student.load_state_dict(ck["student"])
         self.student.eval()
         self.student_epoch = ck.get("epoch", "?")
@@ -127,18 +153,6 @@ class LiveCompareNode(object):
         self.sub = rospy.Subscriber(args.input_topic, CompressedImage, self.on_image,
                                     queue_size=1, buff_size=2 ** 24, tcp_nodelay=True)
         rospy.loginfo("Subscribed to %s" % args.input_topic)
-
-    @staticmethod
-    def _arch_namespace(args, encoder):
-        return argparse.Namespace(
-            dinov2_encoder=encoder, idepth_scale=args.idepth_scale,
-            hidden_dims=list(args.hidden_dims), corr_implementation=args.corr_implementation,
-            corr_levels=args.corr_levels, corr_radius=args.corr_radius,
-            scale_list=list(args.scale_list), scale_corr_radius=args.scale_corr_radius,
-            n_downsample=args.n_downsample, context_norm=args.context_norm,
-            n_gru_layers=args.n_gru_layers, shared_backbone=args.shared_backbone,
-            mixed_precision=args.mixed_precision,
-        )
 
     # ------------------------------------------------------------- input
 
@@ -165,6 +179,13 @@ class LiveCompareNode(object):
         left, right = image[:, :half], image[:, half:]
         if self.args.swap_lr:
             left, right = right, left
+        long_side = self.args.long_side
+        if long_side > 0 and max(left.shape[:2]) != long_side:
+            # Same resampling as training and the deployed node.
+            scale = float(long_side) / max(left.shape[:2])
+            size = (int(round(left.shape[1] * scale)), int(round(left.shape[0] * scale)))
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            left, right = cv2.resize(left, size, interpolation=interp), cv2.resize(right, size, interpolation=interp)
         return left, right
 
     # ------------------------------------------------------- calibration
@@ -361,9 +382,11 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
 
-    parser.add_argument('--teacher_ckpt', default='checkpoints/defomstereo_vitl_sceneflow.pth')
     parser.add_argument('--student_ckpt', default=DEFAULT_CKPT_DIR,
                         help='a student_epoch*.pth file, or a directory to auto-pick the latest')
+    parser.add_argument('--teacher_ckpt', default=None,
+                        help='override the stereo core; default is the one recorded in the student '
+                             'checkpoint, which is the one it was distilled against')
 
     ros = parser.add_argument_group("ROS")
     ros.add_argument('--input_topic', default='/ikan/explore3d/stereo/compressed')
@@ -387,6 +410,13 @@ def parse_args(argv):
 
     run = parser.add_argument_group("runtime")
     run.add_argument('--device', default='cuda')
+    run.add_argument('--long_side', type=int, default=640,
+                     help='resize each eye so its long side is this (aspect kept); 0 = native size')
+    run.add_argument('--mixed_precision', action='store_true')
+    run.add_argument('--valid_iters', type=int, default=None,
+                     help='refinement iterations; default is the checkpoint\'s own value')
+    run.add_argument('--scale_iters', type=int, default=None,
+                     help='scaling updates; default is the checkpoint\'s own value')
 
     vis = parser.add_argument_group("visualisation")
     vis.add_argument('--colormap', default='jet', choices=sorted(COLORMAPS))
@@ -398,25 +428,6 @@ def parse_args(argv):
                           '/ikan/explore3d/depth/image_color or to compare frames over time.')
     vis.add_argument('--vis_max', type=float, default=None)
     vis.add_argument('--jpeg_quality', type=int, default=90)
-
-    arch = parser.add_argument_group("architecture (teacher, must match the checkpoint)")
-    arch.add_argument('--mixed_precision', action='store_true')
-    arch.add_argument('--valid_iters', type=int, default=32)
-    arch.add_argument('--scale_iters', type=int, default=8)
-    arch.add_argument('--idepth_scale', type=float, default=0.5)
-    arch.add_argument('--hidden_dims', nargs='+', type=int, default=[128] * 3)
-    arch.add_argument('--corr_implementation', default='reg',
-                      choices=["reg", "alt", "reg_cuda", "alt_cuda"])
-    arch.add_argument('--shared_backbone', action='store_true')
-    arch.add_argument('--corr_levels', type=int, default=2)
-    arch.add_argument('--corr_radius', type=int, default=4)
-    arch.add_argument('--scale_list', type=float, nargs='+',
-                      default=[0.125, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
-    arch.add_argument('--scale_corr_radius', type=int, default=2)
-    arch.add_argument('--n_downsample', type=int, default=2, choices=[2, 3])
-    arch.add_argument('--context_norm', default='batch',
-                      choices=['group', 'batch', 'instance', 'none'])
-    arch.add_argument('--n_gru_layers', type=int, default=3)
 
     return parser.parse_args(argv)
 

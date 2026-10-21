@@ -75,6 +75,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import argparse
 import collections
+import copy
 import csv
 import json
 import random
@@ -132,6 +133,13 @@ def default_config():
             "amp": True,
             # Teacher batches used to measure output mean/std before training.
             "calibration_batches": 8,
+            # Batches used to re-estimate the student's BatchNorm statistics
+            # before they are frozen for training. 0 keeps the loaded ones.
+            "bn_recalibration_batches": 50,
+            # Run the teacher in bfloat16: ~1.7x faster teacher (~35% faster
+            # epochs on a 4070) for a 1-3% perturbation of the targets. Off by
+            # default; ignored on GPUs without bf16 (e.g. Xavier).
+            "teacher_bf16": False,
         },
         "student": {
             "backbone": "mbconv",          # mbconv | mobilevit
@@ -139,11 +147,13 @@ def default_config():
             "fpn_dim": 128,
             "depth_dim": 64,
             "mobilevit_variant": "s",      # s | xs | xxs
-            "mobilevit_scripts_dir": "",   # blank = auto-locate Yolo_Seg/vit_training/scripts
             "mobilevit_init_from": "",     # optional warm start from a student_mobilevit_*.pth
             # group | batch. group is default: the teacher caps batch size
             # near 2-4, where BatchNorm running stats do not stabilise.
             "norm": "group",
+            # Keep BatchNorm (inside the MobileViT backbone) in eval mode
+            # while training, so train and eval run the same function.
+            "freeze_bn": True,
         },
         "data": {
             # Per-eye long side is drawn from this range, aspect preserved,
@@ -520,16 +530,49 @@ def calibrate_output_scales(teacher_encoder, student, loader, teacher_model, n_d
         print("    %-6s mean %12.3f  std %12.3f" % (key, mean, std))
 
 
+@torch.no_grad()
+def recalibrate_batchnorm(student, loader, teacher_model, n_downsample, device, batches):
+    """Re-estimate the student's BatchNorm running statistics on the training
+    distribution before they are frozen (see DefomStudentEncoder.train).
+
+    Loaded statistics come from another input distribution -- DINOv3
+    pre-training, or an earlier fixed-800x600 run -- so they are replaced by a
+    cumulative average (momentum=None) over `batches` training batches.
+    """
+    norms = [m for m in student.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    if not norms or batches <= 0:
+        return
+    momenta = [m.momentum for m in norms]
+    student.eval()
+    for m in norms:
+        m.reset_running_stats()
+        m.momentum = None
+        m.train()
+    seen = 0
+    for left, right in loader:
+        if seen >= batches:
+            break
+        x, oh, ow, _ = preprocess(teacher_model, left.to(device), right.to(device), n_downsample)
+        student(x, oh, ow)
+        seen += 1
+    for m, momentum in zip(norms, momenta):
+        m.momentum = momentum
+    student.train()
+    print("Re-estimated the statistics of %d BatchNorm layers from %d batches" % (len(norms), seen))
+
+
 # --------------------------------------------------------------------------
 # validation: end-to-end disparity agreement
 # --------------------------------------------------------------------------
 
 
 @torch.no_grad()
-def validate_disparity(model, student, paths, cfg, device, long_side):
+def validate_disparity(model, student, paths, cfg, device, long_side, cache):
     """Swap the student in, compare full-model disparity against the teacher.
 
-    Runs whole frames at one long side, as the deployed node does.
+    Runs whole frames at one long side, as the deployed node does. The
+    teacher's disparity on a given frame never changes, so it is computed once
+    and kept in `cache` (CPU), halving validation time after the first epoch.
 
     The swap is done in place and reverted in a finally block so one model
     instance serves both roles -- holding a second DEFOM just for validation
@@ -549,9 +592,13 @@ def validate_disparity(model, student, paths, cfg, device, long_side):
             padder = InputPadder(left.shape, divis_by=32)
             lp, rp = padder.pad(left, right)
 
-            model.defomencoder.depth_anything = original
-            ref = padder.unpad(model(lp, rp, iters=arch["valid_iters"],
-                                     scale_iters=arch["scale_iters"], test_mode=True))
+            key = (str(data.paths[index]), long_side)
+            if key not in cache:
+                model.defomencoder.depth_anything = original
+                cache[key] = padder.unpad(model(lp, rp, iters=arch["valid_iters"],
+                                                scale_iters=arch["scale_iters"],
+                                                test_mode=True)).cpu()
+            ref = cache[key].to(device)
             model.defomencoder.depth_anything = student
             got = padder.unpad(model(lp, rp, iters=arch["valid_iters"],
                                      scale_iters=arch["scale_iters"], test_mode=True))
@@ -589,17 +636,27 @@ def append_log(checkpoint_dir, record):
 
 
 def resolve_paths(cfg):
-    """Relative paths resolve against the working directory if they exist
-    there, else against the repository root -- so the trainer runs from
-    anywhere, not only from the repo root."""
-    for key in ("image_dir", "teacher_ckpt", "checkpoint_dir", "init_from", "resume_from"):
-        value = cfg["paths"][key]
+    """A copy of cfg whose relative paths resolve against the working directory
+    if they exist there, else against the repository root -- so the trainer
+    runs from anywhere. Checkpoints store the config as written instead, so
+    their paths stay relative and portable to other machines."""
+    cfg = copy.deepcopy(cfg)
+    entries = [("paths", k) for k in ("image_dir", "teacher_ckpt", "checkpoint_dir",
+                                      "init_from", "resume_from")]
+    for section, key in entries + [("student", "mobilevit_init_from")]:
+        value = cfg[section][key]
         if value and not Path(value).is_absolute():
-            cfg["paths"][key] = str(Path(value).resolve() if Path(value).exists() else ROOT / value)
+            cfg[section][key] = str(Path(value).resolve() if Path(value).exists() else ROOT / value)
+    return cfg
 
 
 def train(cfg):
-    resolve_paths(cfg)
+    portable_cfg = cfg
+    # Checkpoints rebuild the student from student_cfg and then load full
+    # weights, so a warm-start path there is never needed -- and may not
+    # exist on the machine that loads them.
+    portable_student_cfg = dict(portable_cfg["student"], mobilevit_init_from="")
+    cfg = resolve_paths(cfg)
     torch.manual_seed(cfg["training"]["seed"])
     random.seed(cfg["training"]["seed"])
     np.random.seed(cfg["training"]["seed"])
@@ -608,7 +665,7 @@ def train(cfg):
     ckpt_dir = Path(cfg["paths"]["checkpoint_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     with (ckpt_dir / "resolved_config.json").open("w", encoding="utf-8") as handle:
-        json.dump(cfg, handle, indent=2)
+        json.dump(portable_cfg, handle, indent=2)
 
     paths = discover_images(cfg["paths"]["image_dir"])
     print("Dataset sessions:")
@@ -636,6 +693,8 @@ def train(cfg):
         step = max(1, len(items) // max(1, cfg["training"]["val_max_frames"]))
         val_sets[source] = items[::step][:cfg["training"]["val_max_frames"]]
     val_keys = ("mean_px", "median_px", "p90_px", "within1", "within2", "within3")
+    teacher_cache = {}
+    previous_ckpt = None
 
     print("Loading teacher: %s" % cfg["paths"]["teacher_ckpt"])
     teacher_model = build_teacher(cfg, device)
@@ -645,9 +704,12 @@ def train(cfg):
     sc = cfg["student"]
     student = build_student(features=out_dim, width=sc["width"], fpn_dim=sc["fpn_dim"],
                             depth_dim=sc["depth_dim"], backbone=sc["backbone"],
-                            mobilevit_scripts_dir=sc["mobilevit_scripts_dir"] or None,
                             mobilevit_variant=sc["mobilevit_variant"],
-                            mobilevit_init_from=sc["mobilevit_init_from"],
+                            # A warm start or resume replaces every backbone weight, so the
+                            # DINOv3 backbone checkpoint would be loaded only to be overwritten
+                            # -- and its absolute path need not exist on another machine.
+                            mobilevit_init_from=("" if cfg["paths"]["init_from"] or cfg["paths"]["resume_from"]
+                                                 else sc["mobilevit_init_from"]),
                             norm=sc["norm"]).to(device)
     print("Student backbone: %s (norm=%s)" % (sc["backbone"], sc["norm"]))
     n_student = count_parameters(student)
@@ -675,6 +737,14 @@ def train(cfg):
         calibrate_output_scales(teacher_encoder, student, loader, teacher_model,
                                 cfg["arch"]["n_downsample"], device,
                                 batches=cfg["training"]["calibration_batches"])
+    if not cfg["paths"]["resume_from"] and student.freeze_bn:
+        recalibrate_batchnorm(student, loader, teacher_model, cfg["arch"]["n_downsample"], device,
+                              cfg["training"]["bn_recalibration_batches"])
+
+    teacher_bf16 = bool(cfg["training"]["teacher_bf16"])
+    if teacher_bf16 and not (device.type == "cuda" and torch.cuda.is_bf16_supported()):
+        print("training.teacher_bf16 ignored: this GPU has no bfloat16 support")
+        teacher_bf16 = False
 
     optimizer = torch.optim.AdamW(student.parameters(), lr=cfg["training"]["lr"],
                                   weight_decay=cfg["training"]["weight_decay"])
@@ -686,9 +756,26 @@ def train(cfg):
     if cfg["paths"]["resume_from"]:
         state = torch.load(cfg["paths"]["resume_from"], map_location=device)
         student.load_state_dict(state["student"])
-        optimizer.load_state_dict(state["optimizer"])
-        scheduler.load_state_dict(state["scheduler"])
         start_epoch = int(state.get("epoch", 0)) + 1
+        if "optimizer" in state:
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            # The restored schedule spans the ORIGINAL run's length. Resuming
+            # with more epochs would run past its end, where the cosine wraps
+            # and the learning rate climbs back up. Stretch it to this run's
+            # length and set the rate to where that longer schedule would be
+            # now -- the scheduler steps recursively from the current rate, so
+            # changing T_max alone would leave it stuck at min_lr.
+            scheduler.T_max = max(1, cfg["training"]["epochs"] * max(1, len(loader)))
+            for group, lr in zip(optimizer.param_groups, scheduler._get_closed_form_lr()):
+                group["lr"] = lr
+        else:
+            # Only the newest checkpoint keeps optimizer state (see below).
+            print("No optimizer state in %s: AdamW restarts; the LR schedule is "
+                  "fast-forwarded to epoch %d" % (cfg["paths"]["resume_from"], start_epoch))
+            optimizer.zero_grad(set_to_none=True)
+            for _ in range(start_epoch * len(loader)):
+                scheduler.step()
         print("Resumed from %s at epoch %d" % (cfg["paths"]["resume_from"], start_epoch))
 
     n_downsample = cfg["arch"]["n_downsample"]
@@ -702,8 +789,11 @@ def train(cfg):
             left, right = left.to(device, non_blocking=True), right.to(device, non_blocking=True)
             x, oh, ow, _ = preprocess(teacher_model, left, right, n_downsample)
 
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=teacher_bf16):
                 teacher_out = teacher_encoder(x, oh, ow)
+            if teacher_bf16:
+                teacher_out = ([t.float() for t in teacher_out[0]],
+                               *(t.float() for t in teacher_out[1:]))
 
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled):
@@ -743,7 +833,7 @@ def train(cfg):
                 if validate:
                     try:
                         metrics = validate_disparity(teacher_model, student, items, cfg, device,
-                                                     long_side)
+                                                     long_side, teacher_cache)
                     except torch.cuda.OutOfMemoryError as exc:
                         torch.cuda.empty_cache()
                         print("  [val %s @%d] skipped -- CUDA OOM (%s). Training is unaffected."
@@ -766,8 +856,18 @@ def train(cfg):
             out = ckpt_dir / ("student_epoch%04d.pth" % epoch)
             torch.save({"student": student.state_dict(), "optimizer": optimizer.state_dict(),
                         "scheduler": scheduler.state_dict(), "epoch": epoch,
-                        "config": cfg, "student_cfg": cfg["student"], "out_dim": out_dim}, out)
+                        "config": portable_cfg, "student_cfg": portable_student_cfg,
+                        "out_dim": out_dim}, out)
             print("  saved %s" % out)
+            # Optimizer state is ~2x the weights and only needed to resume, so
+            # only the newest checkpoint keeps it: ~27 MB per older epoch
+            # instead of ~82 MB.
+            if previous_ckpt is not None and previous_ckpt.exists():
+                state = torch.load(str(previous_ckpt), map_location="cpu")
+                state.pop("optimizer", None)
+                state.pop("scheduler", None)
+                torch.save(state, str(previous_ckpt))
+            previous_ckpt = out
 
     print("Training complete. Checkpoints in %s" % ckpt_dir)
 

@@ -40,12 +40,10 @@ BACKBONES
 ---------
     mbconv      self-contained MBConv/FPN. Zero dependencies outside this
                 folder. 8.9 MB at width 1.0.
-    mobilevit   reuses MobileViT-S from Yolo_Seg/vit_training/scripts, the
-                same architecture as the DINOv3->MobileViT distillation.
-                24.3 MB. Imports across repos, which is the point: it is the
-                single source of truth for that architecture, so a warm start
-                from an existing student_mobilevit_*.pth stays layer-name
-                compatible.
+    mobilevit   MobileViT-S from mobilevit.py in this folder: a frozen copy of
+                the DINOv3->MobileViT distillation's architecture, with the
+                same layer names, so its student_mobilevit_*.pth checkpoints
+                still warm-start it. 24.3 MB.
 
 MobileViT needs its input divisible by 32 -- its 2x2 patch unfold runs on the
 /16 map, which must be even -- so the wrapper resizes up to the next multiple
@@ -55,9 +53,6 @@ above is identical either way.
 """
 
 from __future__ import annotations
-
-import sys
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -148,13 +143,11 @@ class MBConvBackbone(nn.Module):
 
 
 class MobileViTBackbone(nn.Module):
-    """MobileViT-S from Yolo_Seg/vit_training, tapped for intermediates.
+    """MobileViT (mobilevit.py), tapped for intermediates at /4, /8 and /16.
 
-    The upstream `_extract_features` is a flat chain that returns only the
-    final /16 map, so the stages are re-run here explicitly to expose /4, /8
-    and /16. Nothing in the upstream file is modified -- this only reads its
-    submodules, so an existing student_mobilevit_*.pth still loads into
-    `self.net` by its original layer names.
+    The stages are run here explicitly to expose those three scales; layer
+    names match the DINOv3->MobileViT distillation, so its
+    student_mobilevit_*.pth checkpoints load into `self.net` unchanged.
 
     Measured taps at 544x704 input:
         mv2[1..3] ->  64 ch  /4
@@ -165,32 +158,13 @@ class MobileViTBackbone(nn.Module):
 
     MULTIPLE = 32
 
-    def __init__(self, scripts_dir=None, variant="s", in_channels=3, init_from=""):
+    def __init__(self, variant="s", in_channels=3, init_from=""):
         super().__init__()
-        scripts_dir = Path(scripts_dir) if scripts_dir else _default_scripts_dir()
-        if not scripts_dir.is_dir():
-            raise FileNotFoundError(
-                "MobileViT backbone needs Yolo_Seg/vit_training/scripts. Not found at %s. "
-                "Set student.mobilevit_scripts_dir in the config, or use "
-                "student.backbone: mbconv to avoid the dependency entirely." % scripts_dir)
-        if str(scripts_dir) not in sys.path:
-            sys.path.insert(0, str(scripts_dir))
-        try:
-            import mobilevit_distill as mvd
-        except ImportError as exc:
-            raise ImportError("Could not import mobilevit_distill from %s: %s" % (scripts_dir, exc))
+        from mobilevit import mobilevit_s, mobilevit_xs, mobilevit_xxs
 
-        builder = {"s": mvd.mobilevit_s_distill,
-                   "xs": mvd.mobilevit_xs_distill,
-                   "xxs": mvd.mobilevit_xxs_distill}[variant]
-        # image_size only fixes the positional assert, not runtime shape --
-        # verified: a model built at 544x704 runs at 608x800 unchanged.
+        builder = {"s": mobilevit_s, "xs": mobilevit_xs, "xxs": mobilevit_xxs}[variant]
         self.variant = variant
-        self.net = builder(image_size=(544, 704), in_channels=in_channels)
-        # conv2 maps to the 1024-d DINOv3 target, which is irrelevant here --
-        # the FPN head consumes the stage features instead. Dropping it saves
-        # 0.16 M params and avoids a dead branch in the graph.
-        self.net.conv2 = nn.Identity()
+        self.net = builder(in_channels=in_channels)
         self.out_channels = (64, 96, 128, 160)
 
         if init_from:
@@ -230,7 +204,7 @@ class MobileViTBackbone(nn.Module):
         loaded = sum(1 for k, v in state.items() if k in own and own[k].shape == v.shape)
         missing, unexpected = self.net.load_state_dict(state, strict=False)
         print("[MobileViTBackbone] warm start from %s" % path)
-        print("    loaded %d/%d tensors  (missing %d, unexpected %d -- conv2/fc expected here)"
+        print("    loaded %d/%d tensors  (missing %d, unexpected %d -- conv2 expected here)"
               % (loaded, len(own), len(missing), len(unexpected)))
         if loaded < 0.5 * len(own):
             raise RuntimeError(
@@ -258,16 +232,6 @@ class MobileViTBackbone(nn.Module):
         return [f1, f2, f3, f4]
 
 
-def _default_scripts_dir():
-    # DEFOM_Stereo/DEFOM-Stereo_Beex/distillation -> workspace root
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidate = parent / "Yolo_Seg" / "vit_training" / "scripts"
-        if candidate.is_dir():
-            return candidate
-    return here.parent / "mobilevit_scripts"
-
-
 class DefomStudentEncoder(nn.Module):
     """MBConv backbone + light FPN, emitting DepthAnythingV2's output tuple.
 
@@ -279,16 +243,16 @@ class DefomStudentEncoder(nn.Module):
 
     def __init__(self, features=256, width=1.0, fpn_dim=128, depth_dim=64,
                  backbone="mbconv", mobilevit_scripts_dir=None, mobilevit_variant="s",
-                 mobilevit_init_from="", norm="group"):
+                 mobilevit_init_from="", norm="group", freeze_bn=True):
         super().__init__()
         self.out_dim = features
         self.backbone_name = backbone
+        self.freeze_bn = freeze_bn
 
         if backbone == "mbconv":
             self.backbone = MBConvBackbone(width=width, norm=norm)
         elif backbone == "mobilevit":
-            self.backbone = MobileViTBackbone(scripts_dir=mobilevit_scripts_dir,
-                                              variant=mobilevit_variant,
+            self.backbone = MobileViTBackbone(variant=mobilevit_variant,
                                               init_from=mobilevit_init_from)
         else:
             raise ValueError("backbone must be 'mbconv' or 'mobilevit', got %r" % backbone)
@@ -344,6 +308,25 @@ class DefomStudentEncoder(nn.Module):
             # final inverse depth is restored by the clamp in forward().
         )
 
+    def train(self, mode=True):
+        """BatchNorm layers (only inside the MobileViT backbone) stay in eval
+        mode, using their running statistics.
+
+        Batches here hold 8-16 crops, so batch statistics differ from the
+        running ones: measured, train() and eval() outputs differed by 19-22%,
+        meaning training optimised a different function from the one that
+        validation and deployment run. Frozen, the two are identical; the BN
+        affine weights still train. The running statistics are re-estimated
+        on the training data before training starts (distill_defom.py's
+        recalibrate_batchnorm), so freezing them does not freeze a mismatch.
+        """
+        super().train(mode)
+        if mode and self.freeze_bn:
+            for module in self.modules():
+                if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                    module.eval()
+        return self
+
     def _denorm(self, x, name):
         return x * getattr(self, "%s_scale" % name) + getattr(self, "%s_shift" % name)
 
@@ -393,12 +376,16 @@ class DefomStudentEncoder(nn.Module):
 
 def build_student(features=256, width=1.0, fpn_dim=128, depth_dim=64,
                   backbone="mbconv", mobilevit_scripts_dir=None,
-                  mobilevit_variant="s", mobilevit_init_from="", norm="group"):
+                  mobilevit_variant="s", mobilevit_init_from="", norm="group", freeze_bn=True):
+    # mobilevit_scripts_dir is ignored: MobileViT is now mobilevit.py in this
+    # folder. It stays a parameter because checkpoints saved before that
+    # change carry it in their student_cfg, which is passed here as **kwargs.
     return DefomStudentEncoder(features=features, width=width, fpn_dim=fpn_dim,
                                depth_dim=depth_dim, backbone=backbone,
                                mobilevit_scripts_dir=mobilevit_scripts_dir,
                                mobilevit_variant=mobilevit_variant,
-                               mobilevit_init_from=mobilevit_init_from, norm=norm)
+                               mobilevit_init_from=mobilevit_init_from, norm=norm,
+                               freeze_bn=freeze_bn)
 
 
 def count_parameters(model):

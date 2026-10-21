@@ -83,7 +83,7 @@ so they are interchangeable via one config line.
 | `mbconv` width 0.5 | 4.8 MB | ~71.6 MB | none |
 | **`mbconv` width 1.0** (default) | **8.9 MB** | **~75.7 MB** | none |
 | `mbconv` width 1.5 | 15.5 MB | ~82.3 MB | none |
-| `mobilevit` (-S) | 27.2 MB | ~94.0 MB | `Yolo_Seg/vit_training/scripts` |
+| `mobilevit` (-S) | 27.2 MB | ~94.0 MB | none (`mobilevit.py`) |
 
 ```yaml
 student:
@@ -146,19 +146,23 @@ Non-square and variable resolution are otherwise fine.
 
 ## Dependencies on other folders
 
-The default path imports **nothing** from `Yolo_Seg/vit_training`:
+None. Training and export use only this repository plus pip packages
+(torch, torchvision, numpy, opencv, pillow, pyyaml, scipy, timm, opt_einsum,
+einops):
 
 | file | non-pip imports |
 |---|---|
 | `capture_stereo.py` | `rospy`, `sensor_msgs` |
-| `defom_student.py` | none (`mobilevit_distill` only when `backbone: mobilevit`) |
+| `defom_student.py` | `mobilevit` (this folder) |
 | `distill_defom.py` | `core` (DEFOM's own), `defom_student` |
 
-`backbone: mobilevit` is the single exception, and deliberately so — importing
-the real module keeps it the single source of truth and keeps warm starts
-layer-name compatible. It auto-locates `Yolo_Seg/vit_training/scripts` by
-walking up from this folder; override with `student.mobilevit_scripts_dir`. If
-it is missing you get a clear error naming `backbone: mbconv` as the way out.
+`mobilevit.py` is a frozen copy of the architecture from
+`Yolo_Seg/vit_training/scripts/mobilevit_distill.py` -- the version every
+`student_epoch*.pth` here was trained with, verified bit-identical. It used to
+be imported across repositories, so editing that file silently changed this
+model; now it cannot. Layer names are unchanged, so DINOv3 MobileViT
+checkpoints still warm-start it. The default warm start lives in
+`distillation/checkpoints/pretrained/`.
 
 ## How to run
 
@@ -225,7 +229,21 @@ python3 distillation/distill_defom.py \
 model twice. Training was observed to OOM with only ~250 MB free.
 
 Outputs to `paths.checkpoint_dir`: `student_epoch*.pth`, `training_log.csv`,
-`resolved_config.json`.
+`resolved_config.json`. Only the newest checkpoint keeps optimizer state
+(~82 MB); older ones keep just the weights (~27 MB), which is all deployment
+and `live_compare.py` need. Checkpoints store the config as written, so their
+paths stay relative and they load on any machine with the repo.
+
+To extend a finished run, set `paths.resume_from` to its newest checkpoint and
+raise `training.epochs`: the learning-rate schedule is stretched to the new
+length and continues from where that longer schedule would be. Resuming from an
+older (weights-only) checkpoint restarts AdamW and fast-forwards the schedule.
+
+`training.teacher_bf16: true` runs the teacher in bfloat16: measured 456 ->
+272 ms per teacher pass (~25-35% faster epochs on a 4070) for a 1-3%
+perturbation of the targets. It is off by default and ignored on GPUs without
+bf16 (Xavier). Validation computes the teacher's disparity on each held-out
+frame once and reuses it, so later epochs validate in about half the time.
 
 ### 4. Deploy
 
@@ -332,8 +350,16 @@ optimised. With `norm: group` the measured train-vs-eval difference is exactly
 independent.
 
 `norm: batch` is still selectable, but only makes sense at batch sizes this
-setup cannot reach. The `mobilevit` backbone has BatchNorm inside the upstream
-MobileViT blocks regardless; only the FPN head honours this setting.
+setup cannot reach.
+
+The `mobilevit` backbone has BatchNorm inside its MobileViT blocks
+regardless, and it had the same problem: measured, train() and eval() outputs
+differed by 19-22%. So with `student.freeze_bn: true` (default) those layers
+stay in eval mode while training -- train and eval are then identical, and
+the BN affine weights still learn. Their running statistics are first
+re-estimated on the training data (`training.bn_recalibration_batches`, a
+cumulative average), so the frozen statistics match the multi-scale,
+multi-camera mix rather than whatever the warm start was trained on.
 
 ### Output calibration — do not disable this
 
@@ -416,7 +442,8 @@ Confirmed on this machine, on a free GPU:
 - Checkpoint round-trip: `strict=True` load, calibration buffers preserved
   (`fuse_scale` 20777.8), full deploy path rebuilt to 75.6 MB
 - Resume restores epoch, optimiser and scheduler, and correctly skips
-  recalibration
+  recalibration; extending a run stretches the schedule (matches the
+  closed-form cosine exactly), and a weights-only checkpoint resumes too
 - Validation OOM is caught and skipped without losing the epoch
 
 Not yet measured:
@@ -440,5 +467,4 @@ Run step 3 on real data and watch the `[val vs teacher]` line.
 | Student underfits | `student.width` to 1.5, or more data |
 | Epochs too slow | The teacher forward dominates; `vits` as teacher is ~7× faster, at lower teacher quality |
 | A loss term sits at ~1.0 and will not move | Calibration did not run. Check for the `Calibrated output scales` line; raise `training.calibration_batches` |
-| `mobilevit` backbone not found | Set `student.mobilevit_scripts_dir`, or use `backbone: mbconv` |
 | Validation looks great but deployment does not | Likely `val_split: random` on sequential footage, or `norm: batch` |
