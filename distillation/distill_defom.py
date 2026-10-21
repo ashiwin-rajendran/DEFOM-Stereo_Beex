@@ -42,6 +42,19 @@ It is matched RAW: DefomEncoder normalises by its own per-sample max downstream,
 so an extra normalisation here would discard the scale the teacher actually
 emits and leave the student free to drift.
 
+RESOLUTION
+----------
+Training is camera- and resolution-agnostic. Frames may come from any stereo
+camera at any size (DWE SVC 800x600, DWE raw 1600x1200, Voyis 2816x2816 per
+eye) and can be mixed under one image_dir, one folder per capture session.
+Each eye is resized, aspect preserved, to a random long side in
+data.long_side, then both eyes take the same random crop of data.crop. The
+deployed ROS node resizes whole frames to its export resolution, so this is
+the range of content scales the student actually meets. No intrinsics are
+involved anywhere here: the loss is label-free and the encoder runs on each
+eye independently. Calibration belongs to rectification (before capture) and
+to depth computation (in the ROS node), nowhere else.
+
 VALIDATION
 ----------
 Feature loss is a proxy. What matters is end-to-end disparity, so validation
@@ -61,6 +74,7 @@ sys.path.insert(0, str(ROOT / "core"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import argparse
+import collections
 import csv
 import json
 import random
@@ -71,7 +85,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 try:
     import yaml
@@ -132,8 +146,17 @@ def default_config():
             "norm": "group",
         },
         "data": {
-            "height": 600,
-            "width": 800,
+            # Per-eye long side is drawn from this range, aspect preserved,
+            # then both eyes take the same crop (h, w; multiples of 32).
+            "long_side": [512, 1024],
+            "crop": [384, 512],
+            # Equal sampling weight per per-eye resolution, so one camera's
+            # footage cannot drown another's -- capped so no frame is drawn
+            # more than about max_repeat times per epoch.
+            "balance_sources": True,
+            "max_repeat": 4,
+            # End-to-end validation runs on whole frames at these long sides.
+            "val_long_side": [512, 640],
             "swap_lr": False,
             "photometric": True,
             "brightness": 0.2,
@@ -183,6 +206,10 @@ def load_config(path):
             raise ImportError("pyyaml is required to read a config file")
         with open(path, "r", encoding="utf-8") as handle:
             deep_update(cfg, yaml.safe_load(handle) or {})
+    stale = [k for k in ("height", "width") if k in cfg["data"]]
+    if stale:
+        raise SystemExit("data.%s is no longer used: training is resolution-agnostic. "
+                         "Use data.long_side and data.crop instead." % "/".join(stale))
     return cfg
 
 
@@ -213,6 +240,14 @@ cv2.setNumThreads(0)
 class StereoPairDataset(Dataset):
     """Side-by-side frames on disk, split into a left/right pair.
 
+    With long_side=None (training) each eye is resized, aspect preserved, to a
+    random long side in data.long_side and both take the same random crop of
+    data.crop. A fixed resize instead pins the student to one resolution: the
+    student trained at 800x600 was measured at feature rel-MSE 0.11 against
+    the teacher at 800x600, but 0.30-0.47 at 512x384 and 1024x768. With a
+    long_side given (validation) the whole frame is resized to it, uncropped
+    and unaugmented -- what deployment runs.
+
     Geometric augmentation is deliberately restricted. Anything that breaks
     the epipolar relationship between the two views -- an independent crop,
     rotation, or a flip of only one image -- changes the disparity the teacher
@@ -224,12 +259,13 @@ class StereoPairDataset(Dataset):
 
     EXTS = {".png", ".jpg", ".jpeg", ".bmp"}
 
-    def __init__(self, paths, cfg, train=True):
+    def __init__(self, paths, cfg, long_side=None):
         self.paths = list(paths)
         self.cfg = cfg
-        self.train = train
+        train = long_side is None
         d = cfg["data"]
-        self.height, self.width = int(d["height"]), int(d["width"])
+        self.long_side = tuple(d["long_side"]) if train else (long_side, long_side)
+        self.crop = tuple(int(v) for v in d["crop"]) if train else None
         self.swap_lr = bool(d["swap_lr"])
         self.photometric = bool(d["photometric"]) and train
         self.brightness = float(d["brightness"])
@@ -248,9 +284,20 @@ class StereoPairDataset(Dataset):
         if self.swap_lr:
             left, right = right, left
 
-        if (left.shape[0], left.shape[1]) != (self.height, self.width):
-            left = cv2.resize(left, (self.width, self.height), interpolation=cv2.INTER_AREA)
-            right = cv2.resize(right, (self.width, self.height), interpolation=cv2.INTER_AREA)
+        h, w = left.shape[:2]
+        scale = random.uniform(*self.long_side) / max(h, w)
+        size = (max(1, round(w * scale)), max(1, round(h * scale)))
+        if self.crop:
+            size = (max(size[0], self.crop[1]), max(size[1], self.crop[0]))
+        interp = cv2.INTER_AREA if size[0] < w else cv2.INTER_LINEAR
+        left = cv2.resize(left, size, interpolation=interp)
+        right = cv2.resize(right, size, interpolation=interp)
+        if self.crop:
+            ch, cw = self.crop
+            y, x = random.randint(0, size[1] - ch), random.randint(0, size[0] - cw)
+            # The same window in both views: a common shift leaves every
+            # disparity of the rectified pair unchanged.
+            left, right = left[y:y + ch, x:x + cw], right[y:y + ch, x:x + cw]
 
         if self.hflip_pair and random.random() < 0.5:
             # Mirroring a rectified pair swaps which camera is which.
@@ -267,6 +314,71 @@ class StereoPairDataset(Dataset):
 
         to_t = lambda a: torch.from_numpy(a).permute(2, 0, 1).contiguous()
         return to_t(left), to_t(right)
+
+
+def eye_size(path):
+    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise RuntimeError("Unreadable image: %s" % path)
+    return image.shape[1] // 2, image.shape[0]
+
+
+def split_sessions(paths, cfg):
+    """Train/val split per capture session, plus each frame's source.
+
+    A session is one folder of consecutive frames from one camera; its source
+    is that camera's per-eye size, read from its first frame. temporal holds
+    out the tail of EACH session -- consecutive survey frames are near
+    duplicates, so a random split puts near-copies of training frames into
+    validation and reports a number that says nothing about generalisation.
+    """
+    sessions = collections.OrderedDict()
+    for path in paths:
+        sessions.setdefault(path.parent, []).append(path)
+    frac = cfg["training"]["val_fraction"]
+    split = cfg["training"]["val_split"]
+    if split not in ("temporal", "random"):
+        raise ValueError("training.val_split must be 'temporal' or 'random', got %r" % split)
+    rng = random.Random(cfg["training"]["seed"])
+    train_paths, val_paths, source_of = [], [], {}
+    for folder, items in sessions.items():
+        source = "%dx%d" % eye_size(items[0])
+        n_val = int(len(items) * frac)
+        held = items[len(items) - n_val:] if split == "temporal" else rng.sample(items, n_val)
+        held_set = set(held)
+        train_paths += [p for p in items if p not in held_set]
+        val_paths += held
+        for p in items:
+            source_of[p] = source
+        print("  session %-40s %-10s %5d frames  (%d val)" % (folder.name, source, len(items), len(held)))
+    if not val_paths:
+        # Every session shorter than 1/val_fraction: hold out the largest one's tail.
+        items = max(sessions.values(), key=len)
+        val_paths = items[-1:]
+        train_paths = [p for p in train_paths if p != items[-1]]
+    return train_paths, val_paths, source_of
+
+
+def source_shares(counts, total, max_repeat):
+    """Fraction of each epoch drawn from each source: equal, except that no
+    frame is drawn more than max_repeat times per epoch.
+
+    A plain equal share would draw a 1-frame source half of every epoch
+    (measured: one frame ~2700 times). Sources that would exceed the cap are
+    fixed at it, and what they leave is shared equally among the rest.
+    """
+    shares, remaining, budget = {}, set(counts), 1.0
+    while remaining:
+        equal = budget / len(remaining)
+        capped = {s for s in remaining if equal * total / counts[s] > max_repeat}
+        if not capped:
+            shares.update({s: equal for s in remaining})
+            break
+        for s in capped:
+            shares[s] = max_repeat * counts[s] / total
+            budget -= shares[s]
+        remaining -= capped
+    return shares
 
 
 def discover_images(image_dir):
@@ -286,8 +398,7 @@ def discover_images(image_dir):
 
 def build_teacher(cfg, device):
     model = DEFOMStereo(arch_namespace(cfg))
-    ckpt_path = ROOT / cfg["paths"]["teacher_ckpt"] if not Path(cfg["paths"]["teacher_ckpt"]).is_absolute() \
-        else Path(cfg["paths"]["teacher_ckpt"])
+    ckpt_path = Path(cfg["paths"]["teacher_ckpt"])
     checkpoint = torch.load(str(ckpt_path), map_location="cpu")
     model.load_state_dict(checkpoint["model"] if "model" in checkpoint else checkpoint)
     model.to(device).eval()
@@ -415,15 +526,17 @@ def calibrate_output_scales(teacher_encoder, student, loader, teacher_model, n_d
 
 
 @torch.no_grad()
-def validate_disparity(model, student, paths, cfg, device, max_frames):
+def validate_disparity(model, student, paths, cfg, device, long_side):
     """Swap the student in, compare full-model disparity against the teacher.
+
+    Runs whole frames at one long side, as the deployed node does.
 
     The swap is done in place and reverted in a finally block so one model
     instance serves both roles -- holding a second DEFOM just for validation
     would cost another 1.5 GB of VRAM for no benefit.
     """
     arch = cfg["arch"]
-    data = StereoPairDataset(paths[:max_frames], cfg, train=False)
+    data = StereoPairDataset(paths, cfg, long_side=long_side)
     original = model.defomencoder.depth_anything
     stats = []
     was_training = student.training
@@ -475,42 +588,54 @@ def append_log(checkpoint_dir, record):
         writer.writerow(record)
 
 
+def resolve_paths(cfg):
+    """Relative paths resolve against the working directory if they exist
+    there, else against the repository root -- so the trainer runs from
+    anywhere, not only from the repo root."""
+    for key in ("image_dir", "teacher_ckpt", "checkpoint_dir", "init_from", "resume_from"):
+        value = cfg["paths"][key]
+        if value and not Path(value).is_absolute():
+            cfg["paths"][key] = str(Path(value).resolve() if Path(value).exists() else ROOT / value)
+
+
 def train(cfg):
+    resolve_paths(cfg)
     torch.manual_seed(cfg["training"]["seed"])
     random.seed(cfg["training"]["seed"])
     np.random.seed(cfg["training"]["seed"])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_dir = Path(cfg["paths"]["checkpoint_dir"])
-    if not ckpt_dir.is_absolute():
-        ckpt_dir = ROOT / ckpt_dir
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     with (ckpt_dir / "resolved_config.json").open("w", encoding="utf-8") as handle:
         json.dump(cfg, handle, indent=2)
 
     paths = discover_images(cfg["paths"]["image_dir"])
-    n_val = max(1, int(len(paths) * cfg["training"]["val_fraction"]))
-    split = cfg["training"]["val_split"]
-    if split == "temporal":
-        # Survey footage is sequential and consecutive frames are near
-        # duplicates, so a RANDOM split puts near-copies of training frames
-        # into validation and reports an optimistic number that says nothing
-        # about generalisation. capture_stereo.py names files in capture
-        # order, so holding out the tail gives a genuinely unseen segment.
-        train_paths, val_paths = paths[:-n_val], paths[-n_val:]
-    elif split == "random":
-        shuffled = paths[:]
-        random.Random(cfg["training"]["seed"]).shuffle(shuffled)
-        val_paths, train_paths = shuffled[:n_val], shuffled[n_val:]
-    else:
-        raise ValueError("training.val_split must be 'temporal' or 'random', got %r" % split)
-    print("Dataset: %d frames  (%d train / %d val, %s split)"
-          % (len(paths), len(train_paths), len(val_paths), split))
+    print("Dataset sessions:")
+    train_paths, val_paths, source_of = split_sessions(paths, cfg)
+    counts = collections.Counter(source_of[p] for p in train_paths)
+    print("Dataset: %d frames  (%d train / %d val, %s split)  sources %s"
+          % (len(paths), len(train_paths), len(val_paths), cfg["training"]["val_split"],
+             dict(counts)))
 
-    train_set = StereoPairDataset(train_paths, cfg, train=True)
-    loader = DataLoader(train_set, batch_size=cfg["training"]["batch_size"], shuffle=True,
-                        num_workers=cfg["training"]["num_workers"], drop_last=True,
+    train_set = StereoPairDataset(train_paths, cfg)
+    sampler = None
+    if cfg["data"]["balance_sources"] and len(counts) > 1:
+        shares = source_shares(counts, len(train_paths), cfg["data"]["max_repeat"])
+        print("Sampling share per source: %s" % {s: "%.1f%%" % (100 * v) for s, v in shares.items()})
+        weights = [shares[source_of[p]] / counts[source_of[p]] for p in train_paths]
+        sampler = WeightedRandomSampler(weights, num_samples=len(train_paths), replacement=True)
+    loader = DataLoader(train_set, batch_size=cfg["training"]["batch_size"], shuffle=sampler is None,
+                        sampler=sampler, num_workers=cfg["training"]["num_workers"], drop_last=True,
                         pin_memory=(device.type == "cuda"))
+
+    # Validation frames per source, evenly spaced through the held-out tails.
+    val_sets = collections.OrderedDict()
+    for source in sorted(set(source_of[p] for p in val_paths)):
+        items = [p for p in val_paths if source_of[p] == source]
+        step = max(1, len(items) // max(1, cfg["training"]["val_max_frames"]))
+        val_sets[source] = items[::step][:cfg["training"]["val_max_frames"]]
+    val_keys = ("mean_px", "median_px", "p90_px", "within1", "within2", "within3")
 
     print("Loading teacher: %s" % cfg["paths"]["teacher_ckpt"])
     teacher_model = build_teacher(cfg, device)
@@ -540,9 +665,13 @@ def train(cfg):
         student.load_state_dict(state["student"] if "student" in state else state)
         print("Initialised student from %s" % cfg["paths"]["init_from"])
 
-    # Must happen before the optimiser is built and before any resume, so a
-    # resumed run keeps the buffers that were saved with its checkpoint.
-    if not cfg["paths"]["resume_from"]:
+    # Must happen before the optimiser is built and before any resume. A
+    # resumed or warm-started student keeps the buffers saved with it: its
+    # heads were trained against those statistics, and recalibrating would
+    # shift every output. Only a student whose buffers are still at their
+    # defaults (shift 0, scale 1) is calibrated.
+    uncalibrated = student.fuse_scale.item() == 1.0 and student.fuse_shift.item() == 0.0
+    if not cfg["paths"]["resume_from"] and uncalibrated:
         calibrate_output_scales(teacher_encoder, student, loader, teacher_model,
                                 cfg["arch"]["n_downsample"], device,
                                 batches=cfg["training"]["calibration_batches"])
@@ -602,26 +731,32 @@ def train(cfg):
                   "seconds": round(time.time() - started, 1)}
         record.update({k: round(v / n, 6) for k, v in running.items()})
 
-        if val_paths and (epoch % cfg["training"]["val_every"] == 0):
-            # End-to-end validation runs the FULL model twice per frame, which
-            # peaks higher than training does. Losing it must not lose the
-            # epoch's training, so an OOM here is reported and skipped rather
-            # than propagated.
-            try:
-                metrics = validate_disparity(teacher_model, student, val_paths, cfg, device,
-                                             cfg["training"]["val_max_frames"])
-            except torch.cuda.OutOfMemoryError as exc:
-                torch.cuda.empty_cache()
+        validate = epoch % cfg["training"]["val_every"] == 0
+        for source, items in val_sets.items():
+            for long_side in cfg["data"]["val_long_side"]:
+                # End-to-end validation runs the FULL model twice per frame,
+                # which peaks higher than training does. Losing it must not
+                # lose the epoch's training, so an OOM here is reported and
+                # skipped rather than propagated. Keys are written either way
+                # (NaN when skipped) so the CSV columns stay stable.
                 metrics = {}
-                print("  [val] skipped -- CUDA OOM during end-to-end validation (%s). "
-                      "Training is unaffected. Free VRAM, lower training.val_max_frames, "
-                      "or set training.val_every higher." % str(exc).split("\n")[0])
-            if metrics:
-                record.update({k: round(v, 5) for k, v in metrics.items()})
-                print("  [val vs teacher] mean %.2f px | median %.2f | p90 %.2f | "
-                      "within 1/2/3px %.0f%%/%.0f%%/%.0f%%"
-                      % (metrics["mean_px"], metrics["median_px"], metrics["p90_px"],
-                         100 * metrics["within1"], 100 * metrics["within2"], 100 * metrics["within3"]))
+                if validate:
+                    try:
+                        metrics = validate_disparity(teacher_model, student, items, cfg, device,
+                                                     long_side)
+                    except torch.cuda.OutOfMemoryError as exc:
+                        torch.cuda.empty_cache()
+                        print("  [val %s @%d] skipped -- CUDA OOM (%s). Training is unaffected."
+                              % (source, long_side, str(exc).split("\n")[0]))
+                prefix = "val_%s_L%d_" % (source, long_side)
+                record.update({prefix + k: round(metrics[k], 5) if k in metrics else float("nan")
+                               for k in val_keys})
+                if metrics:
+                    print("  [val vs teacher] %-10s @%4d  mean %.2f px | median %.2f | p90 %.2f | "
+                          "within 1/2/3px %.0f%%/%.0f%%/%.0f%%"
+                          % (source, long_side, metrics["mean_px"], metrics["median_px"],
+                             metrics["p90_px"], 100 * metrics["within1"],
+                             100 * metrics["within2"], 100 * metrics["within3"]))
 
         append_log(ckpt_dir, record)
         print("epoch %d done: total %.4f  (%.1f s)" % (epoch, record.get("total", float("nan")),

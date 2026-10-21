@@ -42,7 +42,7 @@ What actually differs, tested rather than assumed:
 |---|---|
 | **Four outputs, not one** — `(d_features, left_feat, right_feat, idepth)` feeding two heads | **the real blocker**; solved by the FPN head in `defom_student.py` |
 | **L2 normalisation** — DPT heads consume raw features, magnitude carries information | real, one line |
-| **Patch 14 vs 16** — DEFOM feeds 532×700 | minor: MobileViT needs /16, so the wrapper resizes to 544×704 |
+| **Patch 14 vs 16** — DEFOM feeds 532×700 | minor: MobileViT needs /32, so the wrapper resizes to 544×704 |
 | ~~Non-square input~~ | **not a problem** — verified `(544,704) → (2,34,44,1024)` |
 | ~~Fixed resolution at construction~~ | **not a problem** — a model built at 544×704 runs at 608×800 unchanged |
 
@@ -127,10 +127,11 @@ different target (1024-d patch tokens vs DEFOM's four outputs), so treat the
 transfer as a head start on low-level features rather than a free win —
 `mobilevit_init_from: ""` trains from scratch for comparison.
 
-MobileViT requires input divisible by 16 and DEFOM feeds 532×700, so the
-wrapper resizes to 544×704 on the way in. (Contrary to what I first thought,
-non-square and variable resolution are both fine — only the /16 constraint is
-real, and it costs one resize.)
+MobileViT requires input divisible by 32 -- its 2x2 patch unfold runs on the
+/16 map, which must therefore be even -- so the wrapper resizes up to the next
+multiple (532×700 -> 544×704). /16 only worked at 532×700 by luck: it crashes
+at 1064×1400 (a 1600×1200 input) and at 336×448 (a 384×512 training crop).
+Non-square and variable resolution are otherwise fine.
 
 ## Files
 
@@ -167,10 +168,22 @@ it is missing you get a clear error naming `backbone: mbconv` as the way out.
 cd DEFOM_Stereo/DEFOM-Stereo_Beex
 python3 distillation/capture_stereo.py \
   --out distillation/datasets/underwater \
-  --max_frames 4000
+  --max_frames 4000                       # add --topic for another camera
 ```
 
-Writes 1600×600 side-by-side PNGs. Frames are deduplicated by mean absolute
+Each run writes a session folder, `<eyeW>x<eyeH>_<timestamp>/` (or
+`--session NAME`), of side-by-side PNGs at the stream's own size. Sessions
+from different cameras live side by side under one root:
+
+```
+datasets/underwater/
+  dwe_svc_legacy/          1600x600  (800x600 per eye; the original 4832 frames)
+  1600x1200_20261022_.../  3200x1200 (DWE raw)
+  2816x2816_20261023_.../  5632x2816 (Voyis)
+```
+
+Frames must be rectified (the SVC's 800x600 stream is, measured at a 0.24 px
+median vertical offset). Frames are deduplicated by mean absolute
 difference (`--min_mad`, default 2.0) — survey footage at 6.5 Hz is highly
 redundant, and without this you get thousands of near-identical frames that
 inflate epoch time and bias the student toward wherever the vehicle lingered.
@@ -232,6 +245,41 @@ model.defomencoder.depth_anything = student     # 1530.5 MB -> 75.6 MB
 
 Everything downstream — `DefomEncoder.forward`, `fnet`, `cnet`, the GRU blocks
 — is untouched, so `demo_v2.py` works as-is on the result.
+
+---
+
+## Resolution: train once, deploy at any size, on any camera
+
+Each eye is resized, aspect preserved, to a random long side in
+`data.long_side` (default 512-1024), then both eyes take the same random crop
+of `data.crop` (384x512). That spans the inference sizes the ROS node exports
+at, whichever camera a frame came from, and a common crop window leaves the
+pair's disparities unchanged. It replaces the old fixed 800x600 resize, which
+squashed non-4:3 cameras and pinned the student to one scale: the 800x600
+student's feature rel-MSE against the teacher was measured at 0.11 at
+800x600, but 0.30-0.47 at 512x384 and 1024x768.
+
+Sampling is balanced per source (per-eye size), so a large DWE set cannot
+drown a small Voyis one. The temporal validation split holds out the tail of
+**each session**, and end-to-end validation reports every source at each
+`data.val_long_side`, e.g. `[val vs teacher] 2816x2816 @ 640 ...`.
+
+No intrinsics enter training: the loss is label-free and the encoder runs on
+each eye independently. Calibration matters only for rectification (before
+capture) and depth (in the ROS node's camera profile).
+
+A warm start (`paths.init_from`) keeps the checkpoint's output-scale buffers:
+its heads were trained against them, so they are not recalibrated.
+
+## Mixed precision
+
+The vitl encoders emit matching features up to ~2e7, past fp16's 65504, so
+with `mixed_precision` the first conv reading them overflowed and the whole
+disparity field became NaN (100% of pixels, reproduced). `core/extractor.py`'s
+`ConvBlock` -- used exactly where depth features enter the stereo core -- now
+always runs that conv in fp32; fp32 output is bit-identical, and fp16 is
+finite, ~1.55x faster on a 4070, and within a 0.05 px median of fp32 (larger
+differences only in textureless water, where stereo is ill-posed).
 
 ---
 

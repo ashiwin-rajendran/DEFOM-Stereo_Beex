@@ -41,8 +41,14 @@ class ConvBlock(nn.Module):
                 self.norm3 = nn.Sequential()
 
     def forward(self, x):
-
-        return self.relu(self.norm1(self.conv(x)))
+        # ConvBlock is where the depth encoder's features enter the stereo core
+        # (fnet.convd, cnet.conv08/16/32). Those features reach ~2e7 for the
+        # vitl encoders -- far beyond fp16's 65504 -- so under mixed precision
+        # this conv overflowed to inf and the whole disparity field became NaN.
+        # The conv therefore always runs in fp32; norm1 brings its output back
+        # to O(1) for everything downstream. A no-op when autocast is off.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            return self.relu(self.norm1(self.conv(x.float())))
 
 
 class ResidualBlock(nn.Module):

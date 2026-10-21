@@ -13,18 +13,23 @@ description: >
   outputs, so any footage from the deployment domain is valid training data.
 
 paths:
-  # Produced by distillation/capture_stereo.py
+  # Produced by distillation/capture_stereo.py: one folder per capture
+  # session, any camera and size mixed (DWE SVC 1600x600, DWE raw 3200x1200,
+  # Voyis 5632x2816 side-by-side). Frames must be rectified.
   image_dir: distillation/datasets/underwater
   teacher_ckpt: checkpoints/defomstereo_vitl_middlebury.pth
-  checkpoint_dir: distillation/checkpoints/underwater_vitl_middlebury_to_student
-  init_from: ""
+  checkpoint_dir: distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale
+  # Warm start from the fixed-800x600 run; multi-scale training then fixes
+  # its accuracy away from 800x600. Blank to train from scratch.
+  init_from: distillation/checkpoints/underwater_vitl_middlebury_to_student/student_epoch0049.pth
   resume_from: ""
 
 training:
   epochs: 50
-  # Each sample puts TWO images (left+right) through the teacher at 532x700,
-  # so effective encoder batch is 2x this. Raise only if VRAM allows.
-  batch_size: 2
+  # Each sample puts TWO images (left+right) through the teacher, so the
+  # effective encoder batch is 2x this. A 384x512 crop costs the teacher
+  # about 40% of an 800x600 frame, hence 4 rather than 2.
+  batch_size: 4
   lr: 0.0003
   min_lr: 0.000001
   weight_decay: 0.0001
@@ -71,7 +76,8 @@ student:
   # eval() were measured to diverge 28-45% on real data -- meaning validation
   # and deployment would run a different function than the one optimised.
   norm: group
-  # Warm start from your DINOv3->MobileViT RGB distillation. Verified: loads
+  # Superseded by paths.init_from when that is set (it already holds a
+  # trained backbone). Warm start from your DINOv3->MobileViT RGB distillation. Verified: loads
   # 304/304 tensors into this backbone. The 6 "unexpected" are conv2
   # (160->1024, the DINOv3 projection), which this head does not use -- it
   # taps mvit[2] at 160ch upstream, so conv2 is replaced by Identity.
@@ -85,8 +91,20 @@ student:
   mobilevit_init_from: /mnt/BeeX-Ashwin/Vision_Tools/Online_Registration/Yolo_Seg/vit_training/weights/old/Distilled_Dinov3_RGB/checkpoints_512_from_448_stage2/student_mobilevit_2M_Dinov3_based_epoch0002.pth
 
 data:
-  height: 600
-  width: 800
+  # Resolution-agnostic: each eye is resized (aspect preserved) to a random
+  # long side in this range, then both eyes take the same random crop. This
+  # spans the export resolutions the ROS node runs at (512-1024 long side),
+  # whichever camera the frame came from.
+  long_side: [512, 1024]
+  crop: [384, 512]              # h, w -- multiples of 32
+  # Equal sampling weight per per-eye resolution (i.e. per camera), so 4.8k
+  # DWE frames cannot drown a few hundred Voyis ones.
+  balance_sources: true
+  # ...but never draw a frame more than ~4x per epoch: a source with only a
+  # handful of frames is boosted, not memorised.
+  max_repeat: 4
+  # End-to-end validation: whole frames at these long sides, per source.
+  val_long_side: [512, 640]
   swap_lr: false
   photometric: true
   brightness: 0.2

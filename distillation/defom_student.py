@@ -47,8 +47,9 @@ BACKBONES
                 from an existing student_mobilevit_*.pth stays layer-name
                 compatible.
 
-MobileViT needs its input divisible by 16 and DEFOM feeds 532x700, so the
-wrapper resizes to the next multiple (544x704) on the way in. Both backbones
+MobileViT needs its input divisible by 32 -- its 2x2 patch unfold runs on the
+/16 map, which must be even -- so the wrapper resizes up to the next multiple
+(532x700 -> 544x704). /16 crashed at 1064x1400 and 336x448. Both backbones
 expose four feature maps and share the same FPN head, so the output contract
 above is identical either way.
 """
@@ -162,7 +163,7 @@ class MobileViTBackbone(nn.Module):
         mvit[2]   -> 160 ch  /16   (mv2[6] is stride-1 upstream)
     """
 
-    MULTIPLE = 16
+    MULTIPLE = 32
 
     def __init__(self, scripts_dir=None, variant="s", in_channels=3, init_from=""):
         super().__init__()
