@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Record side-by-side stereo frames from a ROS topic into a training session.
 
-    python3 distillation/capture_stereo.py --out distillation/datasets/underwater --max_frames 4000
+    python3 distillation/ros_tools/capture_stereo.py --out distillation/datasets/underwater --max_frames 4000
 
 Each run writes <out>/<session>/NNNNNN.png; the session defaults to
 <eyeW>x<eyeH>_<time>. Any camera and size works (DWE 1600x600 or 3200x1200,

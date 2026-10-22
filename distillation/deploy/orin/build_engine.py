@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Build a TensorRT engine from an exported ONNX model, on the device that will run it.
+
+    python3 build_engine.py defom_multiscale_640x480.onnx                 # mixed fp16 (default)
+    python3 build_engine.py defom_multiscale_640x480.onnx --precision fp32
+
+Uses only the TensorRT Python package that ships with JetPack. Writes
+<onnx stem>_<precision>.engine and a .json next to the ONNX file. An engine
+only runs on the GPU and TensorRT version that built it.
+
+Precision:
+  fp32   everything fp32 (reference; slowest)
+  fp16   convolutions, matrix multiplies and activations in fp16, everything
+         else in fp32 -- like PyTorch mixed precision. Coordinate and
+         disparity maths stay exact, and the layers the exporter measured
+         above fp16's range (the .json's fp32_layers) are kept fp32.
+"""
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import tensorrt as trt
+
+# Layer types allowed to run in fp16 in "fp16" mode. Everything else that
+# computes on floats is pinned to fp32.
+FP16_TYPES = {trt.LayerType.CONVOLUTION, trt.LayerType.DECONVOLUTION, trt.LayerType.MATRIX_MULTIPLY,
+              trt.LayerType.ACTIVATION}
+if hasattr(trt.LayerType, "FULLY_CONNECTED"):
+    FP16_TYPES.add(trt.LayerType.FULLY_CONNECTED)
+# Pure data movement: no maths, left to TensorRT.
+FREE_TYPES = {trt.LayerType.CONSTANT, trt.LayerType.SHAPE, trt.LayerType.IDENTITY}
+FLOAT_TYPES = (trt.float32, trt.float16)
+
+
+def float_layer(layer):
+    outputs = [layer.get_output(i) for i in range(layer.num_outputs)]
+    inputs = [layer.get_input(i) for i in range(layer.num_inputs) if layer.get_input(i) is not None]
+    return outputs and all(t.dtype in FLOAT_TYPES for t in outputs) and all(t.dtype in FLOAT_TYPES for t in inputs)
+
+
+def pin_fp32(network, fp32_layers):
+    """Pin every float-computing layer except FP16_TYPES (and the fp32_layers
+    convs) to fp32. Returns (pinned, fp16-eligible) counts."""
+    pinned = eligible = 0
+    for i in range(network.num_layers):
+        layer = network.get_layer(i)
+        if layer.type in FREE_TYPES or not float_layer(layer):
+            continue
+        if layer.type in FP16_TYPES and not any(p in layer.name for p in fp32_layers):
+            eligible += 1
+            continue
+        layer.precision = trt.float32
+        for j in range(layer.num_outputs):
+            layer.set_output_type(j, trt.float32)
+        pinned += 1
+    return pinned, eligible
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("onnx")
+    ap.add_argument("--precision", choices=["fp16", "fp32"], default="fp16")
+    ap.add_argument("--workspace_gb", type=float, default=4.0)
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    onnx_path = Path(args.onnx).resolve()
+    meta_path = onnx_path.with_suffix(".json")
+    meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+    fp32_layers = meta.get("fp32_layers", [])
+    engine_path = onnx_path.with_name("%s_%s.engine" % (onnx_path.stem, args.precision))
+
+    logger = trt.Logger(trt.Logger.VERBOSE if args.verbose else trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    parser = trt.OnnxParser(network, logger)
+    print("TensorRT %s | parsing %s" % (trt.__version__, onnx_path.name))
+    if not parser.parse_from_file(str(onnx_path)):
+        for i in range(parser.num_errors):
+            print("  ", parser.get_error(i))
+        raise SystemExit("ONNX parse failed")
+
+    config = builder.create_builder_config()
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(args.workspace_gb * (1 << 30)))
+    if args.precision == "fp16":
+        if not builder.platform_has_fast_fp16:
+            print("note: this GPU has no fast fp16")
+        config.set_flag(trt.BuilderFlag.FP16)
+        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+        pinned, eligible = pin_fp32(network, fp32_layers)
+        print("layers: %d total, %d may run fp16, %d pinned fp32 (incl. %s)"
+              % (network.num_layers, eligible, pinned, ", ".join(fp32_layers) or "none"))
+
+    print("building %s engine (this can take several minutes) ..." % args.precision)
+    started = time.time()
+    serialized = builder.build_serialized_network(network, config)
+    if serialized is None:
+        raise SystemExit("Engine build failed")
+    build_s = time.time() - started
+    tmp = Path(str(engine_path) + ".tmp")
+    tmp.write_bytes(bytes(serialized))
+    tmp.replace(engine_path)
+    info = {"engine": engine_path.name, "onnx": onnx_path.name, "precision": args.precision,
+            "tensorrt": trt.__version__, "build_seconds": round(build_s, 1),
+            "width": meta.get("width"), "height": meta.get("height"), "iters": meta.get("iters"),
+            "fp32_layers": fp32_layers, "source": {k: meta.get(k) for k in
+                                                   ("source_run", "source_checkpoint", "source_epoch")}}
+    engine_path.with_suffix(".json").write_text(json.dumps(info, indent=2))
+    print("wrote %s (%.1f MB) in %.0f s" % (engine_path, engine_path.stat().st_size / 1e6, build_s))
+
+
+if __name__ == "__main__":
+    main()

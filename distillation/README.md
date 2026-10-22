@@ -17,11 +17,14 @@ the measured results, are in [ANALYSIS.md](ANALYSIS.md).
 distillation/
   distill_defom.py      train a student (any cameras / sizes mixed)
   evaluate.py           compare students against the teacher: report + charts
+  export_model.py       export a student: TorchScript (ROS node) / ONNX (TensorRT on the Orin)
   defom_student.py      the student model, and checkpoint loading
   mobilevit.py          MobileViT backbone (self-contained copy)
-  capture_stereo.py     record training frames from a ROS stereo topic
-  live_compare.py       teacher vs student side by side on a live ROS stream
   configs/underwater_vitl.yaml   the training config
+  ros_tools/            need ROS
+      capture_stereo.py   record training frames from a ROS stereo topic
+      live_compare.py     teacher vs student side by side on a live ROS stream
+  deploy/orin/          copied to the Jetson: build + check TensorRT engines, rectification check
 
   datasets/underwater/<session>/        training frames            (git-ignored)
   checkpoints/<run>/                    one folder per run         (git-ignored)
@@ -31,6 +34,7 @@ distillation/
       training_log.csv        loss and validation per epoch
   checkpoints/pretrained/               DINOv3 MobileViT warm start (from scratch only)
   evaluations/<name>/                   evaluate.py reports        (git-ignored)
+  output_models/<label>_<epoch>/        export_model.py artifacts  (git-ignored)
 
 demo_v3.py   (repo root)   ROS node running a student
 demo_v2.py   (repo root)   ROS node running the full teacher
@@ -76,8 +80,8 @@ Check: `python3 distillation/defom_student.py` must end with `all contracts OK`.
 ## 1. Record training data
 
 ```bash
-python3 distillation/capture_stereo.py --out distillation/datasets/underwater --max_frames 4000
-python3 distillation/capture_stereo.py --out distillation/datasets/underwater --max_frames 4000 \
+python3 distillation/ros_tools/capture_stereo.py --out distillation/datasets/underwater --max_frames 4000
+python3 distillation/ros_tools/capture_stereo.py --out distillation/datasets/underwater --max_frames 4000 \
     --topic /ikan/voyis/stereo_concatenated/compressed --session voyis_dive3
 ```
 
@@ -176,24 +180,46 @@ better** (P(better) above 97.5%).
 
 ---
 
-## 4. Deploy
+## 4. Export and deploy
 
-Export to TorchScript with the ROS package's exporter (in
-`defom_stereo_pointcloud/scripts/`), on the machine that will run it:
+`export_model.py` turns a checkpoint (a run folder uses its `student_best.pth`)
+into deployable models in `distillation/output_models/<label>_<epoch>/`, each
+with a `.json` describing it. Every export is checked on real frames against
+the fp32 PyTorch model and is not written if it disagrees.
+
+`--size` is the **inference** size: the network runs at it and outputs
+disparity at it. It need not equal the camera's resolution (frames are resized
+to it, intrinsics scaled with them); smaller is faster -- compute grows faster
+than the pixel count.
+
+**TorchScript, for the ROS node `defom_stereo_pointcloud` on this PC** (traced
+on `--device`; run it on the same device type):
 
 ```bash
-CK=$DEFOM_REPO/distillation/checkpoints/<run>/student_best.pth
-python3 scripts/export_torchscript.py --repo $DEFOM_REPO --student_ckpt $CK --half --name defom_<run>_640x480_fp16
-python3 scripts/export_torchscript.py --repo $DEFOM_REPO --student_ckpt $CK --half --width 544 --height 544 --name defom_<run>_544x544_fp16
+python3 distillation/export_model.py --ckpt distillation/checkpoints/<run> --format torchscript --size 640x480 --half
+cp distillation/output_models/<label>_<epoch>/defom_<label>_640x480_fp16.{pt,json} \
+   ~/dwe_test/src/defom_stereo_pointcloud/models/
 ```
 
-640×480 for the DWE camera, 544×544 for Voyis.
+**ONNX, for TensorRT on the Orin.** A TensorRT engine only runs on the GPU and
+TensorRT version that built it, so the PC exports ONNX and the Orin builds the
+engine ([deploy/orin/README.md](deploy/orin/README.md)):
+
+```bash
+python3 distillation/export_model.py --ckpt distillation/checkpoints/<run> --format onnx \
+    --size 640x480 --size 800x600 --size 1024x768 --size 1600x1200
+```
+
+The ONNX export rewrites two ops for TensorRT (einsum -> matmul, unfold ->
+conv; identical maths, checked every time) and records which layers must stay
+fp32. `--device cpu` when the GPU is busy (slower). Needs `pip install onnx
+onnxruntime`.
 
 Check a student live on the robot's stream:
 
 ```bash
 python3 demo_v3.py --student_ckpt distillation/checkpoints/<run>        # student as a ROS node
-python3 distillation/live_compare.py --student_ckpt distillation/checkpoints/<run>   # vs teacher, live
+python3 distillation/ros_tools/live_compare.py --student_ckpt distillation/checkpoints/<run>   # vs teacher, live
 ```
 
 Without `--student_ckpt`, both use the multi-scale run's `student_best.pth`

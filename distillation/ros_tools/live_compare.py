@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live teacher-vs-student comparison on the stereo ROS stream.
 
-    python3 distillation/live_compare.py [--student_ckpt distillation/checkpoints/<run>]
+    python3 distillation/ros_tools/live_compare.py [--student_ckpt distillation/checkpoints/<run>]
 
 Runs the full teacher and a distilled student on every frame (one DEFOM
 instance; the student is swapped in for its pass) and publishes:
@@ -19,10 +19,10 @@ and logs agreement as in training validation (mean/median/p90 px, % within
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]          # repository root
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "core"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(ROOT / "distillation"))
 
 import argparse
 import threading
