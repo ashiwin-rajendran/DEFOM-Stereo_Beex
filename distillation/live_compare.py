@@ -1,55 +1,24 @@
 #!/usr/bin/env python3
-"""Live student-vs-teacher comparison on the stereo ROS stream.
+"""Live teacher-vs-student comparison on the stereo ROS stream.
 
-Subscribes to the same side-by-side stereo topic demo_v2/demo_v3 use, runs
-BOTH the vitl teacher and the distilled student on every frame, and publishes
-a side-by-side view plus live agreement stats -- so you can watch training
-progress check out against the real camera, not just the held-out dataset
-frames.
+    python3 distillation/live_compare.py [--student_ckpt distillation/checkpoints/<run>]
 
-    python3 distillation/live_compare.py
+Runs the full teacher and a distilled student on every frame (one DEFOM
+instance; the student is swapped in for its pass) and publishes:
 
-Defaults to the multi-scale run's student_best.pth (a run folder resolves to
-its student_best.pth, else its latest epoch). Override with --student_ckpt to
-pick another run or pin a specific epoch.
+    <output_ns>/teacher/depth[/compressed]   metric 32FC1 / colourised
+    <output_ns>/student/depth[/compressed]   same, on the TEACHER's colour scale
+    <compare_topic>                          left | teacher | student
 
-The teacher (stereo core) and architecture are read from the student
-checkpoint, as demo_v3.py and the exporter do: the student was distilled
-against one specific core, and pairing it with another runs without error but
-measures the wrong model. Frames are resized to --long_side first (default
-640, as the deployed node runs), which also keeps the vitl teacher in memory
-on large streams such as Voyis 2816x2816.
-
-ONE model instance, not two: the student is swapped into the SAME DEFOMStereo
-object's defomencoder.depth_anything for its forward pass, then swapped back
--- exactly the trick validate_disparity() uses during training. Running two
-full 1.5 GB DEFOM instances would work on most GPUs but there is no reason to
-pay for it.
-
-Topics:
-    /ikan/explore3d/defom/teacher/depth/compressed   colourised, shared scale
-    /ikan/explore3d/defom/student/depth/compressed   colourised, SAME scale
-    /ikan/explore3d/defom/teacher/depth              metric, 32FC1
-    /ikan/explore3d/defom/student/depth              metric, 32FC1
-    /ikan/explore3d/defom/compare/compressed         left | teacher | student
-
-The compare image uses ONE colour scale, taken from the teacher's own 2-98th
-percentile per frame. If each panel used its own stretch the two would look
-similar even when they disagree badly -- see demo_v3.py for the same reasoning
-applied to vitl vs vits.
-
-Live agreement (periodic log, same definition training used for
-[val vs teacher]): mean/median/p90 px difference, and the fraction of pixels
-within 1/2/3 px of the teacher.
+and logs agreement as in training validation (mean/median/p90 px, % within
+1/2/3 px). The stereo core and architecture come from the student checkpoint
+(default: the multi-scale run's student_best.pth). Frames are resized to
+--long_side (640, as deployed).
 """
 
 import sys
 from pathlib import Path
 
-# Needs to work regardless of cwd: resolve the repo root relative to this
-# file's own location, same approach distill_defom.py uses, rather than
-# relying on relative strings that only happen to work when launched from
-# the repo root.
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "core"))
@@ -66,17 +35,11 @@ from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 
 from core.defom_stereo import DEFOMStereo
 from core.utils.utils import InputPadder
-from demo_v2 import to_tensor, colorise, COLORMAPS
+from demo_v2 import COLORMAPS, colorise, float_image, load_teacher_weights, repo_path, to_tensor
 from defom_student import load_student
 
 
 DEFAULT_CKPT_DIR = "distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale"
-
-
-def repo_path(path):
-    """Relative paths resolve against the repository root, not the cwd."""
-    path = Path(path)
-    return path if path.is_absolute() else ROOT / path
 
 
 class LiveCompareNode(object):
@@ -106,15 +69,10 @@ class LiveCompareNode(object):
         teacher_ckpt = repo_path(args.teacher_ckpt or ck["config"]["paths"]["teacher_ckpt"])
         rospy.loginfo("Loading teacher (the student's own stereo core): %s" % teacher_ckpt)
         arch = argparse.Namespace(**dict(ck["config"]["arch"], mixed_precision=args.mixed_precision))
-        self.model = DEFOMStereo(arch)
-        state = torch.load(str(teacher_ckpt), map_location="cpu", weights_only=True)
-        self.model.load_state_dict(state["model"] if "model" in state else state)
-        del state
-        self.model.to(self.device).eval()
+        self.model = load_teacher_weights(DEFOMStereo(arch), teacher_ckpt).to(self.device).eval()
         self.teacher_encoder = self.model.defomencoder.depth_anything
         rospy.loginfo("Teacher ready, %.2f GB" % (torch.cuda.memory_allocated() / 1e9))
 
-        self.student.eval()
         self.student_epoch = ck.get("epoch", "?")
         rospy.loginfo("Student ready: epoch %s, backbone %s, %.1f MB"
                       % (self.student_epoch, ck["student_cfg"]["backbone"],
@@ -217,16 +175,6 @@ class LiveCompareNode(object):
 
     # ---------------------------------------------------------- output
 
-    @staticmethod
-    def _raster(header, array):
-        msg = Image()
-        msg.header = header
-        msg.height, msg.width = array.shape
-        msg.encoding = "32FC1"
-        msg.step = 4 * array.shape[1]
-        msg.data = array.tobytes()
-        return msg
-
     def _compressed(self, header, bgr):
         msg = CompressedImage()
         msg.header = header
@@ -249,19 +197,11 @@ class LiveCompareNode(object):
         field_t, valid_t, is_depth = self.to_field(disp_teacher)
         field_s, valid_s, _ = self.to_field(disp_student)
 
-        for disp, field, pub_raster, pub_vis, label in (
-                (disp_teacher, field_t, self.pub_teacher_depth, self.pub_teacher_vis, "teacher"),
-                (disp_student, field_s, self.pub_student_depth, self.pub_student_vis, "student")):
-            pub_raster.publish(self._raster(header, field if is_depth else disp))
+        self.pub_teacher_depth.publish(float_image(header, field_t))
+        self.pub_student_depth.publish(float_image(header, field_s))
 
-        # ONE colour scale, shared by both panels -- see module docstring for
-        # why this matters. Default: 2nd-98th percentile of the teacher's own
-        # frame, recomputed every frame -- always uses full colour contrast,
-        # but the same colour does NOT mean the same depth across frames.
-        # Pass --vis_min/--vis_max for a fixed scale instead -- same colour
-        # means the same absolute depth everywhere, comparable over time and
-        # against /ikan/explore3d/depth/image_color, which uses a fixed scale
-        # of its own (not these values; that node's range is not exposed).
+        # ONE colour scale for both (the teacher's 2-98th percentile, or
+        # --vis_min/--vis_max): separate stretches would hide disagreement.
         if self.args.vis_min is not None and self.args.vis_max is not None:
             lo, hi = self.args.vis_min, self.args.vis_max
         elif valid_t.any():
@@ -273,7 +213,7 @@ class LiveCompareNode(object):
         self.pub_teacher_vis.publish(self._compressed(header, vis_t))
         self.pub_student_vis.publish(self._compressed(header, vis_s))
 
-        if self.pub_info is not None and self.intrinsics is not None:
+        if self.intrinsics is not None:
             fx, fy, cx, cy = self.intrinsics
             info = CameraInfo()
             info.header = header
@@ -335,12 +275,11 @@ class LiveCompareNode(object):
 
             try:
                 disp_t, disp_s, t_t, t_s = self.run_both(left, right)
-            except RuntimeError as exc:
-                if "out of memory" in str(exc).lower():
-                    torch.cuda.empty_cache()
-                    rospy.logerr_throttle(10.0, "CUDA OOM: %s" % exc)
-                    continue
-                raise
+            except torch.cuda.OutOfMemoryError as exc:
+                self.model.defomencoder.depth_anything = self.teacher_encoder
+                torch.cuda.empty_cache()
+                rospy.logerr_throttle(10.0, "CUDA OOM: %s" % exc)
+                continue
 
             self.publish(msg.header, left, disp_t, disp_s, t_t, t_s)
             self.update_agreement(disp_t, disp_s)
@@ -399,11 +338,8 @@ def parse_args(argv):
     vis = parser.add_argument_group("visualisation")
     vis.add_argument('--colormap', default='jet', choices=sorted(COLORMAPS))
     vis.add_argument('--vis_min', type=float, default=None,
-                     help='fixed colour-scale minimum (metres, if calibrated; px otherwise). '
-                          'Default (unset): 2nd-98th percentile of the teacher, recomputed every '
-                          'frame -- always full contrast, but not comparable across frames. Set '
-                          'both --vis_min/--vis_max for a fixed scale, e.g. to match '
-                          '/ikan/explore3d/depth/image_color or to compare frames over time.')
+                     help='fixed colour range (with --vis_max; metres if calibrated, else px); '
+                          'default: the teacher\'s 2-98th percentile per frame')
     vis.add_argument('--vis_max', type=float, default=None)
     vis.add_argument('--jpeg_quality', type=int, default=90)
 

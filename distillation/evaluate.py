@@ -144,17 +144,16 @@ def run(args, models, cfg, sets, device):
     for name, path in models.items():
         student, ck, resolved = load_student(path, device)
         loaded[name] = {"student": student, "ck": ck, "path": str(resolved)}
-    first = next(iter(loaded.values()))["ck"]
-    for name, item in loaded.items():
-        ck = item["ck"]
-        if (ck["config"]["paths"]["teacher_ckpt"] != first["config"]["paths"]["teacher_ckpt"]
-                or ck["config"]["arch"] != first["config"]["arch"]):
-            raise SystemExit("%s was distilled against a different stereo core (%s) than %s (%s). "
-                             "Evaluate them separately." % (name, ck["config"]["paths"]["teacher_ckpt"],
-                                                           next(iter(loaded)), first["config"]["paths"]["teacher_ckpt"]))
+    def teacher_of(ck):
+        path = Path(ck["config"]["paths"]["teacher_ckpt"])
+        return (path if path.is_absolute() else ROOT / path).resolve()
 
-    teacher_ckpt = Path(first["config"]["paths"]["teacher_ckpt"])
-    teacher_ckpt = teacher_ckpt if teacher_ckpt.is_absolute() else ROOT / teacher_ckpt
+    first = next(iter(loaded.values()))["ck"]
+    teacher_ckpt = teacher_of(first)
+    for name, item in loaded.items():
+        if teacher_of(item["ck"]) != teacher_ckpt or item["ck"]["config"]["arch"] != first["config"]["arch"]:
+            raise SystemExit("%s was distilled against a different stereo core (%s) than %s (%s). "
+                             "Evaluate them separately." % (name, teacher_of(item["ck"]), next(iter(loaded)), teacher_ckpt))
     print("Teacher / stereo core: %s" % teacher_ckpt)
     model = DEFOMStereo(argparse.Namespace(**first["config"]["arch"]))
     state = torch.load(str(teacher_ckpt), map_location="cpu", weights_only=True)

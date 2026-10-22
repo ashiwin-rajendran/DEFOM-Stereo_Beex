@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
-"""Record side-by-side stereo frames from the live ROS topic into a training set.
+"""Record side-by-side stereo frames from a ROS topic into a training session.
 
-Distillation needs no ground-truth disparity -- the student is trained to match
-the teacher's outputs -- so any unlabelled stereo footage from the deployment
-domain works, and more of it is strictly better.
+    python3 distillation/capture_stereo.py --out distillation/datasets/underwater --max_frames 4000
 
-    python3 capture_stereo.py --out datasets/underwater --max_frames 4000
-
-Each run writes its own session folder, <out>/<session>/NNNNNN.png, named
-<eyeW>x<eyeH>_<timestamp> unless --session is given. Any side-by-side size
-works (DWE SVC 1600x600, DWE raw 3200x1200, Voyis 5632x2816): the trainer
-groups frames by session for its temporal validation split and by per-eye
-size for balanced sampling, so sources can be mixed freely under one root.
-Frames must already be rectified.
-
-Frames are deduplicated by mean absolute difference against the last kept
-frame. Survey footage is highly redundant at 6.5 Hz: without this you get
-thousands of near-identical images that inflate epoch time without adding
-information, and bias the student toward whatever the vehicle lingered on.
+Each run writes <out>/<session>/NNNNNN.png; the session defaults to
+<eyeW>x<eyeH>_<time>. Any camera and size works (DWE 1600x600 or 3200x1200,
+Voyis 5632x2816) and sessions can be mixed under one root. Frames must already
+be rectified. Near-duplicates (mean abs difference below --min_mad on a
+thumbnail) are skipped, so record while moving. Reusing a session name
+appends after its existing frames.
 """
 
 from __future__ import annotations
@@ -46,12 +37,12 @@ def main():
     parser.add_argument('--expect_width', type=int, default=0,
                         help='warn if the side-by-side width differs; 0 accepts any size')
     parser.add_argument('--format', default='png', choices=['png', 'jpg'],
-                        help='png is lossless -- preferred, since the teacher sees these exact pixels')
+                        help='png is lossless (preferred)')
     args = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
 
     rospy.init_node('stereo_capture', anonymous=True)
 
-    state = {'kept': 0, 'seen': 0, 'last': None, 'start': time.time(), 'dir': None}
+    state = {'kept': 0, 'seen': 0, 'last': None, 'start': time.time(), 'dir': None, 'first': 0}
 
     def callback(msg):
         if state['kept'] >= args.max_frames:
@@ -69,16 +60,18 @@ def main():
                                                     time.strftime("%Y%m%d_%H%M%S"))
             state['dir'] = Path(args.out) / session
             state['dir'].mkdir(parents=True, exist_ok=True)
-            rospy.loginfo("Writing to %s", state['dir'])
-        # Aspect-preserving thumbnail, so the dedup threshold means the same
-        # thing for every camera.
+            # Never overwrite an existing session: continue after its last frame.
+            existing = [int(p.stem) for p in state['dir'].iterdir() if p.stem.isdigit()]
+            state['first'] = max(existing) + 1 if existing else 0
+            rospy.loginfo("Writing to %s (from frame %d)", state['dir'], state['first'])
+        # Aspect-preserving thumbnail: the same threshold for every camera.
         small = cv2.resize(image, (160, max(1, round(160 * image.shape[0] / image.shape[1]))),
                            interpolation=cv2.INTER_AREA)
         if state['last'] is not None and args.min_mad > 0:
             if np.abs(small.astype(np.float32) - state['last']).mean() < args.min_mad:
                 return
         state['last'] = small.astype(np.float32)
-        name = state['dir'] / ("%06d.%s" % (state['kept'], args.format))
+        name = state['dir'] / ("%06d.%s" % (state['first'] + state['kept'], args.format))
         cv2.imwrite(str(name), image)
         state['kept'] += 1
         if state['kept'] % 50 == 0:

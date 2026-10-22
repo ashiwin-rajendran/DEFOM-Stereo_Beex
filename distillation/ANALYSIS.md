@@ -38,7 +38,6 @@ light FPN with separate heads per output. It is a frozen copy of the
 architecture used in the DINOv3→MobileViT distillation, so those checkpoints
 warm-start it (304/304 tensors), and verified bit-identical to the original.
 It lives in this repository so edits elsewhere cannot silently change it.
-`mbconv` is a smaller, fully self-contained alternative (4.8–15.5 MB).
 
 - **Input divisible by 32.** MobileViT unfolds 2×2 patches on the /16 map,
   which must be even. /16 crashed at 1064×1400 (1600×1200 input) and at 336×448

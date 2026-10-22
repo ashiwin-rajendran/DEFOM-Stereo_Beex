@@ -1,22 +1,14 @@
-"""MobileViT backbone for the DEFOM student -- a frozen, self-contained copy.
+"""MobileViT-S architecture for the DEFOM student (a frozen copy).
 
-Vendored from Yolo_Seg/vit_training/scripts/mobilevit_distill.py (md5
-60bfcd588b..., the version every student_epoch*.pth here was trained with), so
-DEFOM training and export no longer depend on that repository: a change there
-can no longer silently change this model. Edit this file deliberately, never
-by syncing.
+Vendored from Yolo_Seg/vit_training/scripts/mobilevit_distill.py, the version
+every student checkpoint here was trained with, so changes there cannot alter
+this model. Parameter names are unchanged: student checkpoints load strictly
+and DINOv3 MobileViT checkpoints warm-start it. Only the layers are kept; the
+DEFOM student runs the stages itself (defom_student.py). `fc` is unused but
+present in existing checkpoints.
 
-Only the architecture is kept. Every parameter name is unchanged, so student
-checkpoints load strictly and DINOv3 MobileViT checkpoints still warm-start it.
-Dropped as unused here: the DINOv3 projection conv2 (160 -> 1024) and the
-forward passes -- DefomStudentEncoder runs the stages itself to tap /4, /8 and
-/16. `fc` is unused too, but kept: existing checkpoints contain it.
-
-Spatial trace (stride 16 overall; mv2[6] is stride 1, unlike stock MobileViT):
-    conv1 /2 -> mv2[1] /4 -> mv2[4] /8, mvit[0] -> mv2[5] /16, mvit[1]
-             -> mv2[6] /16 (stride 1), mvit[2]
-mvit blocks unfold 2x2 patches, so every map they see must have even sides:
-input divisible by 32.
+Strides: conv1 /2, mv2[1] /4, mv2[4] /8, mv2[5] /16, mv2[6] /16 (stride 1,
+unlike stock MobileViT). Input must be divisible by 32.
 """
 
 import torch
@@ -206,18 +198,7 @@ class MobileViT(nn.Module):
         self.mvit.append(MobileViTBlock(dims[1], L[1], channels[7], kernel_size, patch_size, int(dims[1] * 4)))
         self.mvit.append(MobileViTBlock(dims[2], L[2], channels[9], kernel_size, patch_size, int(dims[2] * 4)))
 
-        # Unused by DEFOM; kept only because existing checkpoints contain it.
         self.fc = nn.Linear(1024, num_classes, bias=False)
-
-
-def mobilevit_xxs(in_channels=3):
-    return MobileViT([64, 80, 96], [16, 16, 24, 24, 48, 48, 64, 64, 80, 80, 320],
-                     expansion=2, in_channels=in_channels)
-
-
-def mobilevit_xs(in_channels=3):
-    return MobileViT([96, 120, 144], [16, 32, 48, 48, 64, 64, 80, 80, 96, 96, 384],
-                     in_channels=in_channels)
 
 
 def mobilevit_s(in_channels=3):

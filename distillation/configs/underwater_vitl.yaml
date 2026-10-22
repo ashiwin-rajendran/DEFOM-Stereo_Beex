@@ -1,163 +1,69 @@
-# Distil defomstereo_vitl_middlebury's encoder into a small MobileViT student,
-# multi-scale and multi-camera (DWE + Voyis).
-#
-# Measured on this setup:
-#   teacher encoder (DepthAnythingV2-L)  1463.7 MB
-#   mobilevit-s student                    27.2 MB
-#   reused stereo core (fnet/cnet/GRU)     66.8 MB
-#   deployed model                       ~ 94.0 MB   (vs 1530.5 vitl, 173.2 vits)
+# Fine-tune the best multi-scale MobileViT student on all data under image_dir.
+# Teacher defomstereo_vitl_middlebury (1530 MB) -> deployed student ~94 MB.
+# Every key is explained in ../ANALYSIS.md; defaults live in distill_defom.py.
 
 run_name: underwater_vitl_middlebury_to_student_finetune
 description: >
-  DEFOM-Stereo encoder distillation on explore3d underwater stereo.
-  No labels required: the student regresses the frozen teacher's encoder
-  outputs, so any footage from the deployment domain is valid training data.
+  DEFOM-Stereo encoder distillation on underwater stereo (DWE + Voyis).
+  Label-free: the student matches the frozen teacher's encoder outputs.
 
 paths:
-  # Produced by distillation/capture_stereo.py: one folder per capture
-  # session, any camera and size mixed (DWE SVC 1600x600, DWE raw 3200x1200,
-  # Voyis 5632x2816 side-by-side). Frames must be rectified.
-  image_dir: distillation/datasets/underwater
+  image_dir: distillation/datasets/underwater     # one folder per capture session, any camera; rectified
   teacher_ckpt: checkpoints/defomstereo_vitl_middlebury.pth
-  # One folder per run. Use a new one for each fine-tune, so earlier runs
-  # (and their student_best.pth) are never overwritten.
-  checkpoint_dir: distillation/checkpoints/underwater_vitl_middlebury_to_student_finetune
-  # Fine-tune from the best multi-scale student (epoch 20 of the 40-epoch
-  # run; see ANALYSIS.md). Blank to train from scratch.
-  init_from: distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale/student_best.pth
-  # Only to continue an interrupted run in its own checkpoint_dir.
-  resume_from: ""
+  checkpoint_dir: distillation/checkpoints/underwater_vitl_middlebury_to_student_finetune   # new folder per run
+  init_from: distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale/student_best.pth  # epoch 20
+  resume_from: ""                                  # only to continue an interrupted run
 
 training:
-  # The 40-epoch multi-scale run made all of its measurable gain in epoch 0;
-  # a fine-tune from an already-trained student needs far fewer.
-  epochs: 10
-  # Each sample puts TWO images (left+right) through the teacher, so the
-  # effective encoder batch is 2x this. A 384x512 crop costs the teacher
-  # about 40% of an 800x600 frame, hence 4 rather than 2.
-  batch_size: 4
-  # 3e-4 trained the multi-scale run from the fixed-800x600 student; a lower
-  # rate suits fine-tuning an already-converged one on added data.
-  lr: 0.0001
+  epochs: 10                  # the 40-epoch run gained almost everything in epoch 0
+  batch_size: 4               # stereo pairs per step (8 images through the teacher)
+  lr: 0.0001                  # 3e-4 trained the multi-scale run; lower for fine-tuning
   min_lr: 0.000001
   weight_decay: 0.0001
   grad_clip: 1.0
   num_workers: 4
   seed: 17
   checkpoint_every: 1
-  val_fraction: 0.05
-  # temporal | random. temporal holds out the LAST frames captured. Use it:
-  # consecutive survey frames are near-duplicates, so a random split puts
-  # near-copies of training frames into validation and reports a number that
-  # looks good while saying nothing about generalisation.
-  val_split: temporal
+  val_fraction: 0.05          # last 5% of each session is held out
+  val_split: temporal         # temporal | random (random leaks near-duplicate frames)
   val_every: 1
-  # Held-out frames validated per camera. 24 was too few: one hard frame
-  # moved a line by ~4% and hid a real +5% gain. 80 gives ~1-2% noise.
-  val_max_frames: 80
-  # Validate the starting checkpoint first, so student_best.pth only changes
-  # when training actually beats it. The best epoch is saved as
-  # student_best.pth (+ best.json) in checkpoint_dir.
-  validate_start: true
+  val_max_frames: 80          # per camera; 24 was too noisy to pick an epoch
+  validate_start: true        # score the starting checkpoint first; best only changes if beaten
   amp: true
-  # Teacher batches sampled before training to measure each output's mean/std.
-  # The student's heads then learn a standardised target and denormalise on
-  # output -- without this the huge left/right targets (std ~20931) give
-  # gradients ~1e-4 and that term never trains.
-  calibration_batches: 8
-  # Batches used to re-estimate the MobileViT backbone's BatchNorm statistics
-  # on this data before they are frozen (student.freeze_bn).
+  calibration_batches: 8      # teacher output statistics (only for a fresh student)
   bn_recalibration_batches: 50
-  # bfloat16 teacher: measured 456 -> 272 ms per teacher pass (~35% faster
-  # epochs on a 4070) for a 1-3% perturbation of the distillation targets.
-  # bf16 keeps fp32's range, so the ~2e7 features cannot overflow as they do
-  # in fp16. Ignored on GPUs without bf16 (Xavier).
-  teacher_bf16: true
-  # TF32 tensor cores for fp32 matmuls: teacher 450 -> 334 ms on a 4070 with
-  # the target error unchanged (0.18% -> 0.19%). Needs Ampere or newer.
-  tf32: true
+  teacher_bf16: true          # ~1.7x faster teacher; ignored without bf16 (Xavier)
+  tf32: true                  # faster fp32 matmuls, same accuracy (Ampere+)
 
 student:
-  # mbconv    MBConv/FPN, defined in defom_student.py
-  # mobilevit MobileViT-S from distillation/mobilevit.py -- a frozen copy of the
-  #           DINOv3 distillation's architecture with the same layer names,
-  #           so its student_mobilevit_*.pth checkpoints can warm-start it.
-  #           Both are self-contained: nothing outside this repository.
-  #
-  #   mbconv  width 0.5 ->  4.8 MB   deployed ~71.6 MB
-  #   mbconv  width 1.0 ->  8.9 MB   deployed ~75.7 MB
-  #   mbconv  width 1.5 -> 15.5 MB   deployed ~82.3 MB
-  #   mobilevit-s       -> 27.2 MB   deployed ~94.0 MB
-  backbone: mobilevit
-  width: 1.0              # mbconv only
+  backbone: mobilevit         # MobileViT-S, distillation/mobilevit.py
+  mobilevit_variant: s
   fpn_dim: 128
   depth_dim: 64
-  mobilevit_variant: s          # s | xs | xxs
-  # group | batch. GroupNorm is default and strongly recommended: the teacher
-  # caps batch size near 2-4, and with BatchNorm at that size train() and
-  # eval() were measured to diverge 28-45% on real data -- meaning validation
-  # and deployment would run a different function than the one optimised.
-  norm: group
-  # Keep the MobileViT backbone's BatchNorm in eval mode while training.
-  # Unfrozen, its batch statistics made train() and eval() outputs differ by
-  # 19-22% (measured), so training optimised a different function from the
-  # one validation and deployment run.
-  freeze_bn: true
-  # Superseded by paths.init_from when that is set (it already holds a
-  # trained backbone). Warm start from your DINOv3->MobileViT RGB distillation,
-  # copied into this repo (relative paths resolve against the repo root).
-  # Verified: loads 304/304 tensors into this backbone. The 6 "unexpected"
-  # are conv2 (160->1024, the DINOv3 projection), which this backbone does not
-  # have -- the FPN head taps mvit[2] at 160ch instead.
-  #
-  # Use the .pth, NOT the .pt in the same folder: the .pt is a TorchScript
-  # export and is not a state dict (the loader will tell you so).
-  #
-  # That run was input_mode: rgb at 512x512 from DINOv3 ViT-L/16 -- same
-  # modality as this camera, though a different teacher and a different
-  # target. Blank it out to train the backbone from scratch instead.
+  norm: group                 # FPN normalisation; BatchNorm is unstable at batch 2-4
+  freeze_bn: true             # backbone BatchNorm in eval mode: train == deployed function
+  # DINOv3 MobileViT warm start, used only when training from scratch (no init_from).
   mobilevit_init_from: distillation/checkpoints/pretrained/student_mobilevit_2M_Dinov3_based_epoch0002.pth
 
 data:
-  # Resolution-agnostic: each eye is resized (aspect preserved) to a random
-  # long side in this range, then both eyes take the same random crop. This
-  # spans the export resolutions the ROS node runs at (512-1024 long side),
-  # whichever camera the frame came from.
-  long_side: [512, 1024]
-  crop: [384, 512]              # h, w -- multiples of 32
-  # Equal sampling weight per per-eye resolution (i.e. per camera), so 4.8k
-  # DWE frames cannot drown a few hundred Voyis ones.
-  balance_sources: true
-  # ...but never draw a frame more than ~4x per epoch: a source with only a
-  # handful of frames is boosted, not memorised.
-  max_repeat: 4
-  # End-to-end validation: whole frames at these long sides, per source.
-  val_long_side: [512, 640]
-  swap_lr: false
+  long_side: [512, 1024]      # per-eye resize range (aspect kept), then the same crop on both eyes
+  crop: [384, 512]            # h, w; multiples of 32
+  balance_sources: true       # equal share per camera ...
+  max_repeat: 4               # ... but no frame more than ~4x per epoch
+  val_long_side: [512, 640]   # whole-frame validation sizes
+  swap_lr: false              # true if the right eye is in the left half
   photometric: true
   brightness: 0.2
   contrast: 0.2
-  # Mirrors BOTH views and swaps their order -- the only geometric transform
-  # that keeps a rectified stereo pair valid.
-  hflip_pair: true
+  hflip_pair: true            # mirror both eyes and swap them: keeps the pair valid
 
-loss:
-  # Three d_features scales, then the fused left/right matching features.
+loss:                         # relative MSE per teacher output (see ANALYSIS.md)
   w_dfeat: [1.0, 1.0, 1.0]
   w_left: 1.0
   w_right: 1.0
-  # idepth seeds the disparity field before the GRU refines it, so a bad prior
-  # costs iterations. Raise this if validation shows good features but the
-  # student converges to a visibly different disparity.
   w_idepth: 1.0
-  # relative_mse divides each term by the teacher's own energy. Required:
-  # the teacher's outputs span five orders of magnitude (left/right std
-  # ~20931 vs d_features std ~94-281), so raw mse makes the left/right term
-  # ~10000x larger than everything else and the student ignores the rest.
-  feature_metric: relative_mse   # relative_mse | mse | cosine
 
-arch:
-  # MUST match the teacher checkpoint.
+arch:                         # must match the teacher checkpoint
   dinov2_encoder: vitl
   idepth_scale: 0.5
   hidden_dims: [128, 128, 128]

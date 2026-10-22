@@ -36,8 +36,8 @@ demo_v3.py   (repo root)   ROS node running a student
 demo_v2.py   (repo root)   ROS node running the full teacher
 ```
 
-Everything runs from the repository root; relative paths in configs resolve
-against it. Nothing outside this repository is needed.
+Scripts run from any directory; relative paths resolve against the
+repository root. Nothing outside this repository is needed.
 
 ---
 
@@ -81,7 +81,8 @@ python3 distillation/capture_stereo.py --out distillation/datasets/underwater --
     --topic /ikan/voyis/stereo_concatenated/compressed --session voyis_dive3
 ```
 
-- Each run writes its own session folder (default name `<eyeW>x<eyeH>_<time>`).
+- Each run writes its own session folder (default name `<eyeW>x<eyeH>_<time>`);
+  reusing a `--session` name appends after its existing frames.
 - Any side-by-side size works: DWE 1600×600 or 3200×1200, Voyis 5632×2816.
 - Near-duplicate frames are skipped (`--min_mad 2.0`), so a static camera
   records almost nothing — record while the vehicle moves, underwater.
@@ -213,7 +214,6 @@ Without `--student_ckpt`, both use the multi-scale run's `student_best.pth`
 | `training.tf32` | true | faster fp32 matmuls, same accuracy |
 | `data.long_side` / `crop` | [512, 1024] / [384, 512] | training scales and crop |
 | `data.balance_sources` / `max_repeat` | true / 4 | equal share per camera, capped |
-| `student.backbone` | mobilevit | `mbconv` is a smaller, self-contained alternative |
 
 ## Troubleshooting
 
