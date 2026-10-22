@@ -3,20 +3,22 @@
 vitl/vits encoder -- same stream, same topics, same math as demo_v2.py, just
 a ~75-95 MB encoder instead of 1530 MB.
 
-    python3 demo_v3.py                       # latest middlebury-distilled student
-    python3 demo_v3.py --run multiscale      # latest multi-scale (any camera) student
+    python3 demo_v3.py                       # best multi-scale (any camera) student
+    python3 demo_v3.py --run middlebury      # the original fixed-800x600 student
+    python3 demo_v3.py --student_ckpt distillation/checkpoints/<run>   # any run folder
     python3 demo_v3.py --student_ckpt distillation/checkpoints/.../student_epoch0019.pth
 
-Two trained lines exist, named after the DEFOM-Stereo checkpoint each one's
-student was distilled to match (see distillation/README.md):
+Trained runs, named after the DEFOM-Stereo checkpoint each one's student was
+distilled to match (see distillation/README.md):
 
     sceneflow   distillation/checkpoints/underwater_vitl_to_student/
     middlebury  distillation/checkpoints/underwater_vitl_middlebury_to_student/
     multiscale  distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale/
 
---run picks the directory and auto-resolves its highest-epoch student_epoch
-####.pth -- no path to edit after every resume. --student_ckpt overrides with
-an exact file when you want a specific epoch instead of the latest.
+--run picks the directory and resolves its student_best.pth (the epoch
+training selected by validation), else its highest-epoch student_epoch####.pth.
+--student_ckpt overrides with another folder, or an exact file when you want a
+specific epoch.
 
 WHY THIS FILE IS SHORT: every student checkpoint records its own full
 training config (architecture, and which DEFOM checkpoint its stereo core and
@@ -40,8 +42,6 @@ load_student_model below).
 """
 
 import argparse
-import glob
-import re
 import sys
 from pathlib import Path
 
@@ -52,7 +52,7 @@ sys.path.append('core')
 sys.path.append('distillation')
 
 from core.defom_stereo import DEFOMStereo
-from defom_student import build_student
+from defom_student import load_student, resolve_student_checkpoint
 from demo_v2 import DefomStereoNode, COLORMAPS
 
 
@@ -69,20 +69,6 @@ def repo_path(path):
     """Relative paths resolve against the repository root, not the cwd."""
     path = Path(path)
     return path if path.is_absolute() else ROOT / path
-
-
-def resolve_student_checkpoint(path):
-    """A file is used as-is. A directory resolves to its highest-epoch
-    student_epoch####.pth, so --run keeps working across resumes without
-    anyone editing a flag."""
-    p = repo_path(path)
-    if p.is_file():
-        return p
-    candidates = sorted(p.glob("student_epoch*.pth"),
-                        key=lambda f: int(re.search(r"(\d+)", f.stem).group(1)))
-    if not candidates:
-        raise FileNotFoundError("No student_epoch*.pth under %s" % path)
-    return candidates[-1]
 
 
 def load_student_model(student_ckpt_path, device):
@@ -109,9 +95,8 @@ def load_student_model(student_ckpt_path, device):
     the teacher's out_dim). It is discarded immediately after the swap --
     this deployment only ever needs ONE encoder resident.
     """
-    student_path = resolve_student_checkpoint(student_ckpt_path)
-    rospy.loginfo("Loading student: %s", student_path)
-    ck = torch.load(str(student_path), map_location=device)
+    student, ck, student_path = load_student(student_ckpt_path, device)
+    rospy.loginfo("Loaded student: %s", student_path)
 
     arch_args = argparse.Namespace(**ck["config"]["arch"])
     teacher_ckpt = repo_path(ck["config"]["paths"]["teacher_ckpt"])
@@ -120,20 +105,8 @@ def load_student_model(student_ckpt_path, device):
     model = DEFOMStereo(arch_args)
     # Loaded on the CPU: only the final ~94 MB model goes to the GPU, not the
     # 1.5 GB teacher checkpoint as well.
-    teacher_state = torch.load(str(teacher_ckpt), map_location="cpu")
+    teacher_state = torch.load(str(teacher_ckpt), map_location="cpu", weights_only=True)
     model.load_state_dict(teacher_state["model"] if "model" in teacher_state else teacher_state)
-
-    # mobilevit_init_from in student_cfg is the ORIGINAL training-time warm
-    # start path -- irrelevant here (ck["student"] below overwrites every
-    # weight it would set) and actively harmful: it is an absolute,
-    # machine-specific path baked in at training time (confirmed to differ
-    # between this machine and the DGX Spark), so loading it as recorded
-    # would crash deployment on any machine but the one that trained it, for
-    # a value that cannot change the outcome. Stripped before construction.
-    student_cfg = dict(ck["student_cfg"], mobilevit_init_from="")
-    student = build_student(features=ck["out_dim"], **student_cfg).to(device)
-    student.load_state_dict(ck["student"])
-    student.eval()
 
     del model.defomencoder.depth_anything   # frees the ~1.5 GB teacher encoder
     model.defomencoder.depth_anything = student
@@ -156,12 +129,12 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
 
-    parser.add_argument('--run', default='middlebury', choices=sorted(RUN_DIRS),
-                        help='which distilled line to load the latest checkpoint from. '
-                             'Overridden by --student_ckpt if given.')
+    parser.add_argument('--run', default='multiscale', choices=sorted(RUN_DIRS),
+                        help='which distilled run to load (its student_best.pth, else its '
+                             'latest epoch). Overridden by --student_ckpt if given.')
     parser.add_argument('--student_ckpt', default=None,
-                        help='an exact student_epoch####.pth, or a directory to auto-pick the '
-                             'latest from. Overrides --run.')
+                        help='an exact .pth, or a run folder (student_best.pth, else the '
+                             'latest epoch). Overrides --run.')
 
     # --- ROS --- (identical defaults to demo_v2.py; same stream, same topics)
     ros = parser.add_argument_group("ROS")
@@ -260,7 +233,8 @@ def main():
     # config if the user did not override them, so the CLI default is never
     # silently wrong for whichever checkpoint got loaded.
     if args.valid_iters is None or args.scale_iters is None:
-        ckpt = torch.load(str(resolve_student_checkpoint(args.student_ckpt)), map_location="cpu")
+        ckpt = torch.load(str(resolve_student_checkpoint(args.student_ckpt)), map_location="cpu",
+                          weights_only=True)
         if args.valid_iters is None:
             args.valid_iters = ckpt["config"]["arch"]["valid_iters"]
         if args.scale_iters is None:

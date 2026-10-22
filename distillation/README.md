@@ -1,470 +1,227 @@
-# DEFOM-Stereo encoder distillation
+# DEFOM-Stereo student distillation — how to run
 
-Shrinks `defomstereo_vitl_*` from **1530.5 MB to ~75.6 MB (20.2×)** by replacing
-its DepthAnythingV2 encoder with a small student, while reusing DEFOM's trained
-stereo core unchanged.
+Replaces DEFOM-Stereo's 1.5 GB DepthAnythingV2 encoder with a 27 MB MobileViT
+student, keeping DEFOM's trained stereo core: **1530 MB → ~94 MB**. Training
+needs no ground truth — the student learns to reproduce the teacher's encoder
+outputs on your own unlabelled stereo footage, from any camera and at any
+resolution.
 
-**No ground-truth disparity is needed.** The student regresses the frozen
-teacher's encoder outputs, so any unlabelled stereo footage from the deployment
-domain is valid training data.
-
----
-
-## Read this before starting: the official `vits` may already be enough
-
-| | vitl | vits | distilled student |
-|---|---:|---:|---:|
-| Total size | 1530.5 MB | **173.2 MB** | **~75.6 MB** |
-| Time/frame (32 iters, 800×600) | 0.805 s | 0.472 s | not yet measured |
-| Training required | — | **none** | yes |
-
-`checkpoints/defomstereo_vits_sceneflow.pth` already exists on disk, loads
-cleanly (`missing=0, unexpected=0`), and is 8.8× smaller with zero work.
-Measured against vitl on explore3d footage it tracks closely — median
-disagreement ~1 px, with the differences concentrated in textureless water
-rather than on structure.
-
-So distillation buys roughly **2.3× beyond vits**, not 20× beyond nothing.
-Run `demo_v3.py` first and decide whether that is worth a training cycle.
+This page is the step-by-step guide. **Why** things work the way they do, and
+the measured results, are in [ANALYSIS.md](ANALYSIS.md).
 
 ---
 
-## Relationship to the DINOv3→MobileViT pipeline
+## Layout
 
-The existing distillation in `Yolo_Seg/vit_training` targets a single tensor:
-`x_norm_patchtokens` → `[B, G, G, 1024]`, L2-normalised. The **target
-contract** does not carry over, but the **architecture does** — MobileViT is
-selectable as a backbone here (see below).
+```
+distillation/
+  distill_defom.py      train a student (any cameras / sizes mixed)
+  evaluate.py           compare students against the teacher: report + charts
+  defom_student.py      the student model, and checkpoint loading
+  mobilevit.py          MobileViT backbone (self-contained copy)
+  capture_stereo.py     record training frames from a ROS stereo topic
+  live_compare.py       teacher vs student side by side on a live ROS stream
+  configs/underwater_vitl.yaml   the training config
 
-What actually differs, tested rather than assumed:
+  datasets/underwater/<session>/        training frames            (git-ignored)
+  checkpoints/<run>/                    one folder per run         (git-ignored)
+      student_epoch####.pth   weights of every epoch (newest also holds optimizer state)
+      student_best.pth        the epoch with the best validation  <- use this one
+      best.json               which epoch that is, and its scores
+      training_log.csv        loss and validation per epoch
+  checkpoints/pretrained/               DINOv3 MobileViT warm start (from scratch only)
+  evaluations/<name>/                   evaluate.py reports        (git-ignored)
 
-| | status |
-|---|---|
-| **Four outputs, not one** — `(d_features, left_feat, right_feat, idepth)` feeding two heads | **the real blocker**; solved by the FPN head in `defom_student.py` |
-| **L2 normalisation** — DPT heads consume raw features, magnitude carries information | real, one line |
-| **Patch 14 vs 16** — DEFOM feeds 532×700 | minor: MobileViT needs /32, so the wrapper resizes to 544×704 |
-| ~~Non-square input~~ | **not a problem** — verified `(544,704) → (2,34,44,1024)` |
-| ~~Fixed resolution at construction~~ | **not a problem** — a model built at 544×704 runs at 608×800 unchanged |
+demo_v3.py   (repo root)   ROS node running a student
+demo_v2.py   (repo root)   ROS node running the full teacher
+```
 
-(The last two were claims I made early on and later disproved by testing. They
-are listed so the record is accurate.)
-
-`defom_student.py` matches DepthAnythingV2's *interface* and resizes to the
-requested `(out_h, out_w)` at the end — which is what the teacher's heads
-already do internally — so either backbone satisfies the same contract.
+Everything runs from the repository root; relative paths in configs resolve
+against it. Nothing outside this repository is needed.
 
 ---
 
-## What gets replaced
+## 0. Setup
 
-Measured parameter budget:
+**Python packages** (any machine): `torch`, `torchvision`, `numpy`,
+`opencv-python`, `pillow`, `pyyaml`, `scipy`, `timm`, `opt_einsum`, `einops`;
+plus `matplotlib` for `evaluate.py` charts. `xformers` is optional.
 
-```
-DINOv2-L backbone   1217.5 MB   frozen      ┐
-depth_head           123.8 MB   frozen      ├─ REPLACED by an 8.9 MB student
-depth_feat           122.5 MB   trained     ┘
-fnet / cnet / GRU     66.8 MB   trained     ─── KEPT, loaded from the vitl ckpt
-────────────────────────────────────────
-total               1530.5 MB        →      ~75.6 MB
-```
-
-Because the 66.8 MB stereo core is reused verbatim, the student only has to
-reproduce the encoder's output tuple — it never has to learn stereo matching.
-
----
-
-## Choosing a backbone
-
-Both backbones emit the identical output contract and share the same FPN head,
-so they are interchangeable via one config line.
-
-| `student.backbone` | student | deployed | dependency |
-|---|---:|---:|---|
-| `mbconv` width 0.5 | 4.8 MB | ~71.6 MB | none |
-| **`mbconv` width 1.0** (default) | **8.9 MB** | **~75.7 MB** | none |
-| `mbconv` width 1.5 | 15.5 MB | ~82.3 MB | none |
-| `mobilevit` (-S) | 27.2 MB | ~94.0 MB | none (`mobilevit.py`) |
-
-```yaml
-student:
-  backbone: mobilevit
-  mobilevit_variant: s          # s | xs | xxs
-  mobilevit_init_from: ""       # optional warm start
-```
-or `--backbone mobilevit` on the command line.
-
-`mobilevit` reuses MobileViT-S from your DINOv3 distillation unchanged — the
-wrapper only *reads* its submodules to tap `/4`, `/8` and `/16` intermediates,
-so existing checkpoints stay layer-name compatible.
-
-### Warm-starting from your DINOv3 RGB checkpoints
-
-Verified working against
-`weights/old/Distilled_Dinov3_RGB/checkpoints_512_from_448_stage2/`:
-
-```
-[MobileViTBackbone] warm start from student_mobilevit_2M_Dinov3_based_epoch0002.pth
-    loaded 304/304 tensors  (missing 0, unexpected 6 -- conv2/fc expected here)
-```
-
-**304/304** — a complete warm start. The 6 unexpected tensors are `conv2`
-(160 → 1024, the DINOv3 projection), which this head does not use: it taps
-`mvit[2]` at 160 channels upstream, so `conv2` is replaced with `Identity`.
-
-Two things to get right:
-
-- **Use the `.pth`, not the `.pt`.** The `.pt` in the same folder is a
-  TorchScript export, not a state dict. The loader raises a clear `TypeError`
-  saying so rather than failing obscurely.
-- **The weights live under `model_state_dict`**, not the `model`/`student` key
-  used elsewhere in this repo. The loader searches all four, strips any
-  `module.` prefix, prints how many tensors actually matched, and **raises if
-  fewer than half load** — a silent no-op here would waste the whole run.
-
-That checkpoint came from `input_mode: rgb` at 512×512 against DINOv3 ViT-L/16.
-Same modality as this camera, but a different teacher (DINOv3 vs DINOv2) and a
-different target (1024-d patch tokens vs DEFOM's four outputs), so treat the
-transfer as a head start on low-level features rather than a free win —
-`mobilevit_init_from: ""` trains from scratch for comparison.
-
-MobileViT requires input divisible by 32 -- its 2x2 patch unfold runs on the
-/16 map, which must therefore be even -- so the wrapper resizes up to the next
-multiple (532×700 -> 544×704). /16 only worked at 532×700 by luck: it crashes
-at 1064×1400 (a 1600×1200 input) and at 336×448 (a 384×512 training crop).
-Non-square and variable resolution are otherwise fine.
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `defom_student.py` | Student encoder (both backbones). Drop-in for `DepthAnythingV2`. **Run it directly to verify every contract.** |
-| `capture_stereo.py` | Record training frames from the live ROS topic. |
-| `distill_defom.py` | Trainer. |
-| `configs/underwater_vitl.yaml` | Config. |
-
----
-
-## Dependencies on other folders
-
-None. Training and export use only this repository plus pip packages
-(torch, torchvision, numpy, opencv, pillow, pyyaml, scipy, timm, opt_einsum,
-einops):
-
-| file | non-pip imports |
-|---|---|
-| `capture_stereo.py` | `rospy`, `sensor_msgs` |
-| `defom_student.py` | `mobilevit` (this folder) |
-| `distill_defom.py` | `core` (DEFOM's own), `defom_student` |
-
-`mobilevit.py` is a frozen copy of the architecture from
-`Yolo_Seg/vit_training/scripts/mobilevit_distill.py` -- the version every
-`student_epoch*.pth` here was trained with, verified bit-identical. It used to
-be imported across repositories, so editing that file silently changed this
-model; now it cannot. Layer names are unchanged, so DINOv3 MobileViT
-checkpoints still warm-start it. The default warm start lives in
-`distillation/checkpoints/pretrained/`.
-
-## How to run
-
-### 1. Record training data
+**Jetson Thor** (JetPack 7, Python 3.12, CUDA 13):
 
 ```bash
-cd DEFOM_Stereo/DEFOM-Stereo_Beex
-python3 distillation/capture_stereo.py \
-  --out distillation/datasets/underwater \
-  --max_frames 4000                       # add --topic for another camera
+conda create -n defomstereo python=3.12 -y && conda activate defomstereo
+pip install torch==2.10.0 torchvision==0.25.0 --index-url https://pypi.jetson-ai-lab.io/sbsa/cu130
+pip install --no-deps nvidia-cudss-cu13
+pip install nvpl-lapack nvpl-blas numpy opencv-python pillow pyyaml scipy timm opt_einsum einops matplotlib
+SITE=$CONDA_PREFIX/lib/python3.12/site-packages
+conda env config vars set LD_LIBRARY_PATH=$SITE/nvpl/lib:$SITE/nvidia/cu13/lib PYTHONNOUSERSITE=1
+conda deactivate && conda activate defomstereo
+python -c "import torch; print(torch.cuda.get_arch_list())"   # must include sm_110
 ```
 
-Each run writes a session folder, `<eyeW>x<eyeH>_<timestamp>/` (or
-`--session NAME`), of side-by-side PNGs at the stream's own size. Sessions
-from different cameras live side by side under one root:
+**Files to copy in** (git-ignored, so not in a clone):
 
-```
-datasets/underwater/
-  dwe_svc_legacy/          1600x600  (800x600 per eye; the original 4832 frames)
-  1600x1200_20261022_.../  3200x1200 (DWE raw)
-  2816x2816_20261023_.../  5632x2816 (Voyis)
-```
-
-Frames must be rectified (the SVC's 800x600 stream is, measured at a 0.24 px
-median vertical offset). Frames are deduplicated by mean absolute
-difference (`--min_mad`, default 2.0) — survey footage at 6.5 Hz is highly
-redundant, and without this you get thousands of near-identical frames that
-inflate epoch time and bias the student toward wherever the vehicle lingered.
-
-Play a bag first if you are not live. More data is strictly better; aim for a
-few thousand frames spanning the scene variety you care about.
-
-### 2. Check the student size you want
-
-```bash
-python3 distillation/defom_student.py
-```
-
-```
-width 0.5 :  1194133 params    4.8 MB fp32
-width 1.0 :  2212777 params    8.9 MB fp32
-width 1.5 :  3871741 params   15.5 MB fp32
-```
-
-Add ~66.8 MB of reused stereo core to get the deployed size.
-
-### 3. Train
-
-```bash
-python3 distillation/distill_defom.py --config distillation/configs/underwater_vitl.yaml
-```
-
-Overrides without editing the config:
-
-```bash
-python3 distillation/distill_defom.py \
-  --config distillation/configs/underwater_vitl.yaml \
-  --image_dir distillation/datasets/underwater \
-  --epochs 30 --batch_size 2 --width 1.5
-```
-
-**Stop any running `demo_v2.py` / `demo_v3.py` first.** The teacher alone needs
-~1.5 GB of weights plus activation, and end-to-end validation runs the full
-model twice. Training was observed to OOM with only ~250 MB free.
-
-Outputs to `paths.checkpoint_dir`: `student_epoch*.pth`, `training_log.csv`,
-`resolved_config.json`. Only the newest checkpoint keeps optimizer state
-(~82 MB); older ones keep just the weights (~27 MB), which is all deployment
-and `live_compare.py` need. Checkpoints store the config as written, so their
-paths stay relative and they load on any machine with the repo.
-
-To extend a finished run, set `paths.resume_from` to its newest checkpoint and
-raise `training.epochs`: the learning-rate schedule is stretched to the new
-length and continues from where that longer schedule would be. Resuming from an
-older (weights-only) checkpoint restarts AdamW and fast-forwards the schedule.
-
-`training.teacher_bf16: true` runs the teacher in bfloat16: measured 456 ->
-272 ms per teacher pass (~25-35% faster epochs on a 4070) for a 1-3%
-perturbation of the targets. It is off by default and ignored on GPUs without
-bf16 (Xavier). Validation computes the teacher's disparity on each held-out
-frame once and reuses it, so later epochs validate in about half the time.
-
-### 4. Deploy
-
-Load the vitl checkpoint, then swap the encoder:
-
-```python
-model = DEFOMStereo(args)                       # args.dinov2_encoder = 'vitl'
-model.load_state_dict(torch.load('checkpoints/defomstereo_vitl_sceneflow.pth')['model'])
-
-state = torch.load('distillation/checkpoints/.../student_epoch0019.pth')
-# student_cfg and out_dim are stored in the checkpoint, so the student is
-# rebuilt exactly as trained -- backbone included.
-student = build_student(features=state['out_dim'], **state['student_cfg'])
-student.load_state_dict(state['student'])      # calibration buffers come with it
-model.defomencoder.depth_anything = student     # 1530.5 MB -> 75.6 MB
-```
-
-Everything downstream — `DefomEncoder.forward`, `fnet`, `cnet`, the GRU blocks
-— is untouched, so `demo_v2.py` works as-is on the result.
-
----
-
-## Resolution: train once, deploy at any size, on any camera
-
-Each eye is resized, aspect preserved, to a random long side in
-`data.long_side` (default 512-1024), then both eyes take the same random crop
-of `data.crop` (384x512). That spans the inference sizes the ROS node exports
-at, whichever camera a frame came from, and a common crop window leaves the
-pair's disparities unchanged. It replaces the old fixed 800x600 resize, which
-squashed non-4:3 cameras and pinned the student to one scale: the 800x600
-student's feature rel-MSE against the teacher was measured at 0.11 at
-800x600, but 0.30-0.47 at 512x384 and 1024x768.
-
-Sampling is balanced per source (per-eye size), so a large DWE set cannot
-drown a small Voyis one. The temporal validation split holds out the tail of
-**each session**, and end-to-end validation reports every source at each
-`data.val_long_side`, e.g. `[val vs teacher] 2816x2816 @ 640 ...`.
-
-No intrinsics enter training: the loss is label-free and the encoder runs on
-each eye independently. Calibration matters only for rectification (before
-capture) and depth (in the ROS node's camera profile).
-
-A warm start (`paths.init_from`) keeps the checkpoint's output-scale buffers:
-its heads were trained against them, so they are not recalibrated.
-
-## Mixed precision
-
-The vitl encoders emit matching features up to ~2e7, past fp16's 65504, so
-with `mixed_precision` the first conv reading them overflowed and the whole
-disparity field became NaN (100% of pixels, reproduced). `core/extractor.py`'s
-`ConvBlock` -- used exactly where depth features enter the stereo core -- now
-always runs that conv in fp32; fp32 output is bit-identical, and fp16 is
-finite, ~1.55x faster on a 4070, and within a 0.05 px median of fp32 (larger
-differences only in textureless water, where stereo is ill-posed).
-
----
-
-## How the loss works, and the one thing that will bite you
-
-Five teacher tensors are matched. Feature maps use the same reduction as your
-DINOv3 distillation: **sum over channels, mean over batch and space**.
-
-The default metric is `relative_mse`, and that default is load-bearing. The
-teacher's outputs span five orders of magnitude:
-
-| output | std | absmax |
-|---|---:|---:|
-| `d_features[0]` | 93.7 | 663 |
-| `d_features[1]` | 281.2 | 1,551 |
-| `d_features[2]` | 121.9 | 606 |
-| `left_feat` / `right_feat` | **20,931** | **272,297** |
-| `idepth` | 87.9 | 287 |
-
-Under plain `mse` the left/right term evaluates around **1.1e11** while the
-`d_features` terms sit near **1e6** — so with equal weights the student
-optimises the matching features alone and ignores everything else. Dividing
-each term by the teacher's own energy makes every term a dimensionless relative
-error of order 1, so a well-scaled untrained student starts near `total ≈ 6.0`
-(six terms × ~1.0) and the configured weights mean what they look like.
-
-Only set `feature_metric: mse` if you deliberately want that imbalance.
-
-`idepth` is matched **raw**, with L1. `DefomEncoder` normalises it by its own
-per-sample max downstream, so normalising here would discard the scale the
-teacher actually emits.
-
-### Normalisation: GroupNorm, not BatchNorm
-
-The teacher needs ~1.5 GB of weights plus activation, which caps the usable
-batch size around 2-4. BatchNorm would see 4-8 samples per forward and its
-running statistics never stabilise. Measured on a real in-distribution frame
-with BatchNorm at batch 2:
-
-| output | train vs eval relative difference |
-|---|---:|
-| `d_features[0]` | 0.45 |
-| `left_feat` | 0.40 |
-| `idepth` | 0.28 |
-
-That is not cosmetic. Validation and deployment both run `eval()`, so a 28-45%
-gap means they execute a measurably different function than the one being
-optimised. With `norm: group` the measured train-vs-eval difference is exactly
-`0.00e+00` -- GroupNorm has no running statistics and is batch-size
-independent.
-
-`norm: batch` is still selectable, but only makes sense at batch sizes this
-setup cannot reach.
-
-The `mobilevit` backbone has BatchNorm inside its MobileViT blocks
-regardless, and it had the same problem: measured, train() and eval() outputs
-differed by 19-22%. So with `student.freeze_bn: true` (default) those layers
-stay in eval mode while training -- train and eval are then identical, and
-the BN affine weights still learn. Their running statistics are first
-re-estimated on the training data (`training.bn_recalibration_batches`, a
-cumulative average), so the frozen statistics match the multi-scale,
-multi-camera mix rather than whatever the warm start was trained on.
-
-### Output calibration — do not disable this
-
-Balancing the loss terms is not sufficient on its own. The student's heads also
-have to *reach* those magnitudes, and a freshly initialised head emits O(1)
-against a `left_feat` target of ~2e4. The relative-loss gradient there is
-roughly `-2/t ≈ 1e-4`, so that term simply does not train. Measured over
-8 epochs without calibration:
-
-| term | epoch 0 | epoch 7 | moved |
-|---|---:|---:|---:|
-| `left` | 0.999998 | 0.999985 | **0.001%** |
-| `right` | 0.999998 | 0.999992 | **0.001%** |
-| total | 5.9984 | 5.9801 | 0.3% |
-
-So before training, `calibration_batches` teacher batches are sampled to
-measure each output's mean and std, and those are stored as buffers in the
-student. The heads then predict a **standardised** target and denormalise on
-output — the external contract is unchanged, but each head only has to learn
-an O(1) function. Same 8 epochs, with calibration:
-
-| term | epoch 0 | epoch 6 | moved |
-|---|---:|---:|---:|
-| `left` | 1.045 | 0.844 | **19%** |
-| `right` | 1.042 | 0.847 | **19%** |
-| `idepth` | 0.428 | 0.082 | **81%** |
-| total | 5.1698 | 3.8807 | 25% |
-
-End-to-end disparity over the same run: within-3px **28% → 61%**, median
-12.74 → 1.94 px.
-
-The buffers travel in the checkpoint, and calibration is skipped on resume so a
-resumed run keeps the statistics it was trained with.
-
----
-
-## Validation split: temporal, not random
-
-`val_split: temporal` holds out the last frames captured. This matters for the
-same reason frame deduplication does: consecutive survey frames are
-near-duplicates, so a random split drops near-copies of training frames into
-validation and reports a number that looks good while measuring nothing about
-generalisation. `capture_stereo.py` writes files in capture order, so the tail
-is a genuinely unseen segment.
-
-`random` is available if your frames are already independent.
-
-## Validation
-
-Feature loss is a proxy. What matters is end-to-end disparity, so validation
-temporarily swaps the student into the real DEFOM model and compares its output
-against the unmodified teacher on held-out frames — the same metric
-`demo_v3.py` reports live:
-
-```
-[val vs teacher] mean 1.84 px | median 0.71 | p90 5.20 | within 1/2/3px 61%/74%/82%
-```
-
-The swap is in-place and reverted in a `finally`, so one model instance serves
-both roles rather than holding a second 1.5 GB copy.
-
-Use `demo_v3.py` for the final check — it runs the distilled model against vitl
-and vits on the same live frame with a shared colour scale.
-
----
-
-## Verified vs. not
-
-Confirmed on this machine, on a free GPU:
-
-- Output contract matches the teacher exactly for **both** backbones and all
-  `mbconv` widths (`python3 distillation/defom_student.py` asserts this)
-- Encoder surgery: 1530.5 MB → 75.6 MB, end-to-end disparity finite over the
-  full frame
-- Multi-epoch training converges: total loss 5.17 → 3.88, every one of the six
-  terms decreasing
-- End-to-end validation runs each epoch; disparity agreement improved
-  within-3px 28% → 61%, median 12.74 → 1.94 px
-- MobileViT backbone trains (5.17 → 4.45) and reports ~93.9 MB deployed
-- Checkpoint round-trip: `strict=True` load, calibration buffers preserved
-  (`fuse_scale` 20777.8), full deploy path rebuilt to 75.6 MB
-- Resume restores epoch, optimiser and scheduler, and correctly skips
-  recalibration; extending a run stretches the schedule (matches the
-  closed-form cosine exactly), and a weights-only checkpoint resumes too
-- Validation OOM is caught and skipped without losing the epoch
-
-Not yet measured:
-
-- Student inference speed vs vits (needs a trained student)
-- Accuracy on a real dataset — all of the above used a 6-frame synthetic set
-  purely to exercise the machinery. The absolute numbers mean nothing; only
-  the fact that they move does.
-
-Run step 3 on real data and watch the `[val vs teacher]` line.
-
----
-
-## Tuning notes
-
-| Symptom | Knob |
+| file | where |
 |---|---|
-| CUDA OOM in training | `training.batch_size` to 1; each sample puts 2 images through the teacher |
-| CUDA OOM only in validation | `training.val_max_frames` down, or `training.val_every` up — it is already non-fatal |
-| Features match but disparity is off | Raise `loss.w_idepth` — the prior seeds the disparity field before the GRU refines it |
-| Student underfits | `student.width` to 1.5, or more data |
-| Epochs too slow | The teacher forward dominates; `vits` as teacher is ~7× faster, at lower teacher quality |
-| A loss term sits at ~1.0 and will not move | Calibration did not run. Check for the `Calibrated output scales` line; raise `training.calibration_batches` |
-| Validation looks great but deployment does not | Likely `val_split: random` on sequential footage, or `norm: batch` |
+| `defomstereo_vitl_middlebury.pth` (the teacher) | `checkpoints/` |
+| the student run(s) you start from | `distillation/checkpoints/<run>/` |
+| `student_mobilevit_2M_Dinov3_based_epoch0002.pth` (scratch only) | `distillation/checkpoints/pretrained/` |
+| training frames | `distillation/datasets/underwater/<session>/` |
+
+Check: `python3 distillation/defom_student.py` must end with `all contracts OK`.
+
+---
+
+## 1. Record training data
+
+```bash
+python3 distillation/capture_stereo.py --out distillation/datasets/underwater --max_frames 4000
+python3 distillation/capture_stereo.py --out distillation/datasets/underwater --max_frames 4000 \
+    --topic /ikan/voyis/stereo_concatenated/compressed --session voyis_dive3
+```
+
+- Each run writes its own session folder (default name `<eyeW>x<eyeH>_<time>`).
+- Any side-by-side size works: DWE 1600×600 or 3200×1200, Voyis 5632×2816.
+- Near-duplicate frames are skipped (`--min_mad 2.0`), so a static camera
+  records almost nothing — record while the vehicle moves, underwater.
+- Frames must be **rectified**.
+
+---
+
+## 2. Train
+
+The config is set up for the next step: **fine-tune the best multi-scale
+student on all the data in `datasets/underwater/`** (including anything new you
+added), into a new run folder.
+
+```bash
+python3 -u distillation/distill_defom.py --config distillation/configs/underwater_vitl.yaml \
+    2>&1 | tee distill_finetune.log
+```
+
+On the Thor, run it inside `tmux` so it survives a disconnect.
+
+Other cases, by command-line override:
+
+| goal | add |
+|---|---|
+| fine-tune from another student | `--init_from distillation/checkpoints/<run>` (a folder uses its `student_best.pth`) |
+| keep each run separate | `--checkpoint_dir distillation/checkpoints/<new_run_name>` |
+| continue an **interrupted** run | `--resume_from distillation/checkpoints/<run> --checkpoint_dir distillation/checkpoints/<run>` (a folder uses its newest epoch; `init_from` is then ignored) |
+| more / fewer epochs, other learning rate | `--epochs 15`, `--lr 5e-5` |
+| other data folder | `--image_dir /path/to/sessions` |
+
+Use `--init_from` (fine-tune) to add data; use `--resume_from` only to finish
+an interrupted run, never from `student_best.pth` (the trainer refuses). The
+difference is explained in [ANALYSIS.md](ANALYSIS.md#fine-tuning-vs-resuming).
+Give every fine-tune its own `--checkpoint_dir`, so an earlier run's
+`student_best.pth` is never overwritten.
+
+**What you will see:**
+
+```
+Validating the starting checkpoint ...
+  [val vs teacher] 800x600    @ 512  mean 2.29 px | median 1.91 | p90 4.27 | within 1/2/3px 70%/79%/82%
+  new best: start (val score 77.12%) -> student_best.pth
+  epoch 0  step  20/2714  total 1.20  idepth 0.11  lr 1.00e-04  (0.62 s/step, 0.00 s waiting for data)
+  ...
+  new best: epoch 3 (val score 78.40%) -> student_best.pth        # or: best remains ...
+```
+
+- **val score** = mean "within 3 px" over every camera and size; higher is
+  better. `student_best.pth` is updated only when it improves — including
+  over the starting checkpoint, so a fine-tune can never make it worse.
+- **waiting for data** near 0 means the GPU is the limit (expected). If it
+  grows, raise `training.num_workers`.
+- Speed: ~0.53 s/step on an RTX 4070, ~0.62 s/step on the Thor
+  (`teacher_bf16` + `tf32`); an epoch over ~11k frames is ~25–30 min.
+
+---
+
+## 3. Evaluate
+
+Compare any students against the teacher on held-out frames, with a report:
+
+```bash
+python3 distillation/evaluate.py \
+    --models orig=distillation/checkpoints/underwater_vitl_middlebury_to_student/student_epoch0049.pth \
+             multiscale=distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale \
+             finetune=distillation/checkpoints/underwater_vitl_middlebury_to_student_finetune \
+    --out distillation/evaluations/finetune_vs_multiscale
+```
+
+- A directory picks its `student_best.pth`. Name models `name=path`.
+- The first model is the **reference** the others are compared to
+  (`--reference` to change it).
+- New dive the students never saw: `--image_dir /path/to/new_sessions --frames all`.
+- ~10–15 min for 4 models × 80 frames per camera × 2 sizes on a 4070.
+
+Open `distillation/evaluations/<name>/report.md`. It has:
+
+| section | tells you |
+|---|---|
+| **Verdict** | the best model, and whether each beats the reference beyond noise |
+| **Ranking** | overall score with 95% CI, paired gain vs the reference, P(better), speed |
+| **Per camera and size** | where each model is strong or weak |
+| `summary.png` | agreement and depth error per camera/size, with error bars |
+| `nearness.png` | depth error from far to near |
+| `texture.png` | agreement on structure vs open water |
+| `training_curves_<run>.png` | loss and validation per epoch, best epoch marked |
+| `samples_<camera>.jpg` | left / teacher / each model's disparity, and their error maps |
+
+Rule of thumb: trust a difference only when the report says **clearly
+better** (P(better) above 97.5%).
+
+---
+
+## 4. Deploy
+
+Export to TorchScript with the ROS package's exporter (in
+`defom_stereo_pointcloud/scripts/`), on the machine that will run it:
+
+```bash
+CK=$DEFOM_REPO/distillation/checkpoints/<run>/student_best.pth
+python3 scripts/export_torchscript.py --repo $DEFOM_REPO --student_ckpt $CK --half --name defom_<run>_640x480_fp16
+python3 scripts/export_torchscript.py --repo $DEFOM_REPO --student_ckpt $CK --half --width 544 --height 544 --name defom_<run>_544x544_fp16
+```
+
+640×480 for the DWE camera, 544×544 for Voyis.
+
+Check a student live on the robot's stream:
+
+```bash
+python3 demo_v3.py --student_ckpt distillation/checkpoints/<run>        # student as a ROS node
+python3 distillation/live_compare.py --student_ckpt distillation/checkpoints/<run>   # vs teacher, live
+```
+
+Without `--student_ckpt`, both use the multi-scale run's `student_best.pth`
+(epoch 20).
+
+---
+
+## Config quick reference
+
+| key | default | meaning |
+|---|---|---|
+| `paths.init_from` | multi-scale `student_best.pth` | student to start from (fine-tune) |
+| `paths.checkpoint_dir` | `..._finetune` | output folder; one per run |
+| `training.epochs` / `lr` | 10 / 1e-4 | fine-tune length and rate |
+| `training.batch_size` | 4 | pairs per step (each runs 2 images through the teacher) |
+| `training.val_max_frames` | 80 | held-out frames validated per camera |
+| `training.teacher_bf16` | true | ~1.7× faster teacher; ignored on GPUs without bf16 (Xavier) |
+| `training.tf32` | true | faster fp32 matmuls, same accuracy |
+| `data.long_side` / `crop` | [512, 1024] / [384, 512] | training scales and crop |
+| `data.balance_sources` / `max_repeat` | true / 4 | equal share per camera, capped |
+| `student.backbone` | mobilevit | `mbconv` is a smaller, self-contained alternative |
+
+## Troubleshooting
+
+| symptom | fix |
+|---|---|
+| CUDA out of memory in training | `training.batch_size` 2; stop other GPU processes |
+| out of memory in validation only | lower `training.val_max_frames`; it is skipped, not fatal |
+| `best.json was scored on different validation frames` | expected after adding data: the held-out set changed, so the old best is not comparable and tracking restarts |
+| `libnvpl_*` / `libcudss` not found (Thor) | the NVPL / cuDSS steps in Setup |
+| a loss term stuck near 1.0 | output calibration did not run — training from scratch needs `training.calibration_batches` > 0 |
+| `No student_best.pth or student_epoch*.pth` | wrong run folder |

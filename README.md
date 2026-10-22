@@ -1,3 +1,12 @@
+> **BeeX fork.** This repository adds a distilled, camera-agnostic student for
+> underwater stereo: the 1.5 GB DepthAnythingV2 encoder is replaced by a 27 MB
+> MobileViT, keeping DEFOM's stereo core (1530 MB -> ~94 MB).
+>
+> - **How to run** -- record data, train, evaluate, deploy: [distillation/README.md](distillation/README.md)
+> - **What it does and the measured results**: [distillation/ANALYSIS.md](distillation/ANALYSIS.md)
+>
+> Everything below is the upstream DEFOM-Stereo README.
+
 # DEFOM-Stereo [CVPR 2025]
 
 The Official Pytorch Implementation for

@@ -7,7 +7,7 @@
 #   reused stereo core (fnet/cnet/GRU)     66.8 MB
 #   deployed model                       ~ 94.0 MB   (vs 1530.5 vitl, 173.2 vits)
 
-run_name: underwater_vitl_middlebury_to_student_multiscale
+run_name: underwater_vitl_middlebury_to_student_finetune
 description: >
   DEFOM-Stereo encoder distillation on explore3d underwater stereo.
   No labels required: the student regresses the frozen teacher's encoder
@@ -19,19 +19,26 @@ paths:
   # Voyis 5632x2816 side-by-side). Frames must be rectified.
   image_dir: distillation/datasets/underwater
   teacher_ckpt: checkpoints/defomstereo_vitl_middlebury.pth
-  checkpoint_dir: distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale
-  # Warm start from the fixed-800x600 run; multi-scale training then fixes
-  # its accuracy away from 800x600. Blank to train from scratch.
-  init_from: distillation/checkpoints/underwater_vitl_middlebury_to_student/student_epoch0049.pth
+  # One folder per run. Use a new one for each fine-tune, so earlier runs
+  # (and their student_best.pth) are never overwritten.
+  checkpoint_dir: distillation/checkpoints/underwater_vitl_middlebury_to_student_finetune
+  # Fine-tune from the best multi-scale student (epoch 20 of the 40-epoch
+  # run; see ANALYSIS.md). Blank to train from scratch.
+  init_from: distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale/student_best.pth
+  # Only to continue an interrupted run in its own checkpoint_dir.
   resume_from: ""
 
 training:
-  epochs: 50
+  # The 40-epoch multi-scale run made all of its measurable gain in epoch 0;
+  # a fine-tune from an already-trained student needs far fewer.
+  epochs: 10
   # Each sample puts TWO images (left+right) through the teacher, so the
   # effective encoder batch is 2x this. A 384x512 crop costs the teacher
   # about 40% of an 800x600 frame, hence 4 rather than 2.
   batch_size: 4
-  lr: 0.0003
+  # 3e-4 trained the multi-scale run from the fixed-800x600 student; a lower
+  # rate suits fine-tuning an already-converged one on added data.
+  lr: 0.0001
   min_lr: 0.000001
   weight_decay: 0.0001
   grad_clip: 1.0
@@ -45,8 +52,13 @@ training:
   # looks good while saying nothing about generalisation.
   val_split: temporal
   val_every: 1
-  # End-to-end validation runs the full model twice per frame, so keep it small.
-  val_max_frames: 24
+  # Held-out frames validated per camera. 24 was too few: one hard frame
+  # moved a line by ~4% and hid a real +5% gain. 80 gives ~1-2% noise.
+  val_max_frames: 80
+  # Validate the starting checkpoint first, so student_best.pth only changes
+  # when training actually beats it. The best epoch is saved as
+  # student_best.pth (+ best.json) in checkpoint_dir.
+  validate_start: true
   amp: true
   # Teacher batches sampled before training to measure each output's mean/std.
   # The student's heads then learn a standardised target and denormalise on
@@ -60,7 +72,7 @@ training:
   # epochs on a 4070) for a 1-3% perturbation of the distillation targets.
   # bf16 keeps fp32's range, so the ~2e7 features cannot overflow as they do
   # in fp16. Ignored on GPUs without bf16 (Xavier).
-  teacher_bf16: false
+  teacher_bf16: true
   # TF32 tensor cores for fp32 matmuls: teacher 450 -> 334 ms on a 4070 with
   # the target error unchanged (0.18% -> 0.19%). Needs Ampere or newer.
   tf32: true

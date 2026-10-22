@@ -9,9 +9,9 @@ frames.
 
     python3 distillation/live_compare.py
 
-Defaults to the latest checkpoint under distillation/checkpoints/<run>/ --
-no need to edit the epoch number after every resume. Override with
---student_ckpt to pin a specific one.
+Defaults to the multi-scale run's student_best.pth (a run folder resolves to
+its student_best.pth, else its latest epoch). Override with --student_ckpt to
+pick another run or pin a specific epoch.
 
 The teacher (stereo core) and architecture are read from the student
 checkpoint, as demo_v3.py and the exporter do: the student was distilled
@@ -56,8 +56,6 @@ sys.path.insert(0, str(ROOT / "core"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import argparse
-import glob
-import re
 import threading
 import time
 import cv2
@@ -69,30 +67,16 @@ from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from core.defom_stereo import DEFOMStereo
 from core.utils.utils import InputPadder
 from demo_v2 import to_tensor, colorise, COLORMAPS
-from defom_student import build_student
+from defom_student import load_student
 
 
-DEFAULT_CKPT_DIR = "distillation/checkpoints/underwater_vitl_middlebury_to_student"
+DEFAULT_CKPT_DIR = "distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale"
 
 
 def repo_path(path):
     """Relative paths resolve against the repository root, not the cwd."""
     path = Path(path)
     return path if path.is_absolute() else ROOT / path
-
-
-def resolve_student_checkpoint(path):
-    """A file is used as-is. A directory resolves to its highest-epoch
-    student_epoch####.pth -- so this keeps working across resumes without
-    editing a flag every time."""
-    p = repo_path(path)
-    if p.is_file():
-        return p
-    candidates = sorted(p.glob("student_epoch*.pth"),
-                        key=lambda f: int(re.search(r"(\d+)", f.stem).group(1)))
-    if not candidates:
-        raise FileNotFoundError("No student_epoch*.pth under %s" % path)
-    return candidates[-1]
 
 
 class LiveCompareNode(object):
@@ -112,9 +96,8 @@ class LiveCompareNode(object):
         self.agreement = {"n": 0, "mean": 0.0, "median": 0.0, "p90": 0.0,
                           "w1": 0.0, "w2": 0.0, "w3": 0.0}
 
-        student_path = resolve_student_checkpoint(args.student_ckpt)
-        rospy.loginfo("Loading student: %s" % student_path)
-        ck = torch.load(str(student_path), map_location="cpu")
+        self.student, ck, student_path = load_student(args.student_ckpt, self.device)
+        rospy.loginfo("Loaded student: %s" % student_path)
         if args.valid_iters is None:
             args.valid_iters = ck["config"]["arch"]["valid_iters"]
         if args.scale_iters is None:
@@ -124,18 +107,13 @@ class LiveCompareNode(object):
         rospy.loginfo("Loading teacher (the student's own stereo core): %s" % teacher_ckpt)
         arch = argparse.Namespace(**dict(ck["config"]["arch"], mixed_precision=args.mixed_precision))
         self.model = DEFOMStereo(arch)
-        state = torch.load(str(teacher_ckpt), map_location="cpu")
+        state = torch.load(str(teacher_ckpt), map_location="cpu", weights_only=True)
         self.model.load_state_dict(state["model"] if "model" in state else state)
         del state
         self.model.to(self.device).eval()
         self.teacher_encoder = self.model.defomencoder.depth_anything
         rospy.loginfo("Teacher ready, %.2f GB" % (torch.cuda.memory_allocated() / 1e9))
 
-        # The warm-start path in student_cfg is irrelevant (every weight comes
-        # from ck["student"]) and may not exist on this machine.
-        student_cfg = dict(ck["student_cfg"], mobilevit_init_from="")
-        self.student = build_student(features=ck["out_dim"], **student_cfg).to(self.device)
-        self.student.load_state_dict(ck["student"])
         self.student.eval()
         self.student_epoch = ck.get("epoch", "?")
         rospy.loginfo("Student ready: epoch %s, backbone %s, %.1f MB"
@@ -383,7 +361,7 @@ def parse_args(argv):
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
 
     parser.add_argument('--student_ckpt', default=DEFAULT_CKPT_DIR,
-                        help='a student_epoch*.pth file, or a directory to auto-pick the latest')
+                        help='a .pth file, or a run folder (its student_best.pth, else the latest epoch)')
     parser.add_argument('--teacher_ckpt', default=None,
                         help='override the stereo core; default is the one recorded in the student '
                              'checkpoint, which is the one it was distilled against')

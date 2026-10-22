@@ -77,6 +77,7 @@ import argparse
 import collections
 import copy
 import csv
+import hashlib
 import json
 import random
 import time
@@ -95,7 +96,7 @@ except ImportError:
 
 from core.defom_stereo import DEFOMStereo
 from core.utils.utils import InputPadder, get_danv2_io_size
-from defom_student import build_student, count_parameters
+from defom_student import build_student, count_parameters, resolve_student_checkpoint
 
 
 # --------------------------------------------------------------------------
@@ -129,7 +130,13 @@ def default_config():
             # random leaks on sequential survey footage.
             "val_split": "temporal",
             "val_every": 1,
-            "val_max_frames": 24,
+            # Held-out frames validated per source. 24 proved too few: one
+            # hard frame moved a line by ~4%, enough to hide a real +5%
+            # improvement in the epoch-by-epoch log. 80 gives ~1-2% noise.
+            "val_max_frames": 80,
+            # Validate the starting checkpoint (init_from / resume_from) before
+            # training, so student_best.pth only changes if training beats it.
+            "validate_start": True,
             "amp": True,
             # Teacher batches used to measure output mean/std before training.
             "calibration_batches": 8,
@@ -632,12 +639,23 @@ def validate_disparity(model, student, paths, cfg, device, long_side, cache):
 
 def append_log(checkpoint_dir, record):
     path = Path(checkpoint_dir) / "training_log.csv"
-    exists = path.exists()
-    with path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(record.keys()))
-        if not exists:
-            writer.writeheader()
-        writer.writerow(record)
+    rows, fields = [], list(record.keys())
+    if path.exists():
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+            old = list(reader.fieldnames or [])
+        if old == fields:
+            with path.open("a", newline="", encoding="utf-8") as handle:
+                csv.DictWriter(handle, fieldnames=fields).writerow(record)
+            return
+        # Columns changed (e.g. a resume that validates other cameras):
+        # rewrite with the union, so no value lands under the wrong header.
+        fields = old + [k for k in fields if k not in old]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, restval="")
+        writer.writeheader()
+        writer.writerows(rows + [record])
 
 
 def resolve_paths(cfg):
@@ -662,6 +680,22 @@ def train(cfg):
     # exist on the machine that loads them.
     portable_student_cfg = dict(portable_cfg["student"], mobilevit_init_from="")
     cfg = resolve_paths(cfg)
+    # A resume restores every weight itself, so a fine-tune source left in the
+    # config (the default one has it) is ignored rather than loaded in vain.
+    if cfg["paths"]["resume_from"] and cfg["paths"]["init_from"]:
+        print("resume_from is set: ignoring init_from (%s)" % cfg["paths"]["init_from"])
+        cfg["paths"]["init_from"] = ""
+    # A run folder works too: fine-tuning starts from its best epoch,
+    # resuming from its newest (the one holding the optimizer state).
+    if cfg["paths"]["init_from"]:
+        cfg["paths"]["init_from"] = str(resolve_student_checkpoint(cfg["paths"]["init_from"]))
+    if cfg["paths"]["resume_from"]:
+        cfg["paths"]["resume_from"] = str(resolve_student_checkpoint(cfg["paths"]["resume_from"],
+                                                                     prefer_best=False))
+        if Path(cfg["paths"]["resume_from"]).name == "student_best.pth":
+            raise SystemExit("resume_from is a student_best.pth: resume from the run's newest "
+                             "student_epoch####.pth (or its folder), or fine-tune from the best "
+                             "with init_from.")
     torch.manual_seed(cfg["training"]["seed"])
     random.seed(cfg["training"]["seed"])
     np.random.seed(cfg["training"]["seed"])
@@ -699,6 +733,76 @@ def train(cfg):
         val_sets[source] = items[::step][:cfg["training"]["val_max_frames"]]
     val_keys = ("mean_px", "median_px", "p90_px", "within1", "within2", "within3")
     teacher_cache = {}
+
+    def validate_all():
+        """Validate every source at every long side. Returns record entries
+        for all of them -- NaN where skipped -- so the CSV columns stay stable.
+
+        End-to-end validation runs the FULL model twice per frame, which peaks
+        higher than training does. Losing it must not lose the epoch's
+        training, so an OOM is reported and skipped rather than propagated.
+        """
+        out = {}
+        for source, items in val_sets.items():
+            for long_side in cfg["data"]["val_long_side"]:
+                metrics = {}
+                try:
+                    metrics = validate_disparity(teacher_model, student, items, cfg, device,
+                                                 long_side, teacher_cache)
+                except torch.cuda.OutOfMemoryError as exc:
+                    torch.cuda.empty_cache()
+                    print("  [val %s @%d] skipped -- CUDA OOM (%s). Training is unaffected."
+                          % (source, long_side, str(exc).split("\n")[0]))
+                prefix = "val_%s_L%d_" % (source, long_side)
+                out.update({prefix + k: round(metrics[k], 5) if k in metrics else float("nan")
+                            for k in val_keys})
+                if metrics:
+                    print("  [val vs teacher] %-10s @%4d  mean %.2f px | median %.2f | p90 %.2f | "
+                          "within 1/2/3px %.0f%%/%.0f%%/%.0f%%"
+                          % (source, long_side, metrics["mean_px"], metrics["median_px"],
+                             metrics["p90_px"], 100 * metrics["within1"],
+                             100 * metrics["within2"], 100 * metrics["within3"]))
+        scores = [v for k, v in out.items() if k.endswith("_within3") and v == v]
+        # The selection score: mean within-3px over every source x size, each
+        # weighted equally, so a small camera counts as much as a large one.
+        out["val_score"] = round(sum(scores) / len(scores), 5) if scores else float("nan")
+        return out
+
+    # Best checkpoint. A score is only comparable on the SAME held-out frames,
+    # sizes and iterations, so best.json records a signature of them; a
+    # previous best is kept only when the signature matches.
+    signature = hashlib.sha1(json.dumps({
+        "frames": sorted(str(p) for items in val_sets.values() for p in items),
+        "long_sides": list(cfg["data"]["val_long_side"]),
+        "iters": [cfg["arch"]["valid_iters"], cfg["arch"]["scale_iters"]],
+    }).encode()).hexdigest()[:12]
+    best_json, best_pth = ckpt_dir / "best.json", ckpt_dir / "student_best.pth"
+    best = {"score": float("-inf"), "epoch": None}
+    if best_json.exists():
+        previous = json.loads(best_json.read_text())
+        if previous.get("signature") == signature:
+            best = previous
+            print("Best so far (same validation): %s, score %.2f%%"
+                  % (best["epoch"], 100 * best["score"]))
+        else:
+            print("best.json was scored on different validation frames; tracking afresh")
+
+    def update_best(metrics, epoch_label):
+        score = metrics.get("val_score", float("nan"))
+        if not score == score:
+            return
+        if score > best["score"]:
+            best.update({"score": score, "epoch": epoch_label, "signature": signature,
+                         "metrics": {k: v for k, v in metrics.items() if k.startswith("val_")}})
+            torch.save({"student": student.state_dict(), "epoch": epoch_label,
+                        "config": portable_cfg, "student_cfg": portable_student_cfg,
+                        "out_dim": out_dim, "val_score": score, "val_signature": signature},
+                       str(best_pth))
+            best_json.write_text(json.dumps(best, indent=2))
+            print("  new best: %s (val score %.2f%%) -> %s" % (epoch_label, 100 * score, best_pth.name))
+        else:
+            print("  best remains %s (val score %.2f%%; this one %.2f%%)"
+                  % (best["epoch"], 100 * best["score"], 100 * score))
     previous_ckpt = None
 
     print("Loading teacher: %s" % cfg["paths"]["teacher_ckpt"])
@@ -767,6 +871,11 @@ def train(cfg):
 
     if cfg["paths"]["resume_from"]:
         state = torch.load(cfg["paths"]["resume_from"], map_location=device, weights_only=True)
+        if not isinstance(state.get("epoch", 0), int):
+            raise SystemExit("resume_from %s is a best-checkpoint copy (epoch %r), not a training "
+                             "epoch. Resume from the run's newest student_epoch####.pth (or its "
+                             "folder), or fine-tune from this one with init_from."
+                             % (cfg["paths"]["resume_from"], state["epoch"]))
         student.load_state_dict(state["student"])
         start_epoch = int(state.get("epoch", 0)) + 1
         if "optimizer" in state:
@@ -789,6 +898,13 @@ def train(cfg):
             for _ in range(start_epoch * len(loader)):
                 scheduler.step()
         print("Resumed from %s at epoch %d" % (cfg["paths"]["resume_from"], start_epoch))
+
+    # After any resume, so the weights validated are the ones training starts from.
+    # A resume whose best.json matches has scored these weights already.
+    if cfg["training"]["validate_start"] and (cfg["paths"]["init_from"] or
+                                              (cfg["paths"]["resume_from"] and best["epoch"] is None)):
+        print("Validating the starting checkpoint ...")
+        update_best(validate_all(), "start")
 
     n_downsample = cfg["arch"]["n_downsample"]
 
@@ -844,32 +960,14 @@ def train(cfg):
                   "seconds": round(time.time() - started, 1)}
         record.update({k: round(v / n, 6) for k, v in running.items()})
 
-        validate = epoch % cfg["training"]["val_every"] == 0
-        for source, items in val_sets.items():
-            for long_side in cfg["data"]["val_long_side"]:
-                # End-to-end validation runs the FULL model twice per frame,
-                # which peaks higher than training does. Losing it must not
-                # lose the epoch's training, so an OOM here is reported and
-                # skipped rather than propagated. Keys are written either way
-                # (NaN when skipped) so the CSV columns stay stable.
-                metrics = {}
-                if validate:
-                    try:
-                        metrics = validate_disparity(teacher_model, student, items, cfg, device,
-                                                     long_side, teacher_cache)
-                    except torch.cuda.OutOfMemoryError as exc:
-                        torch.cuda.empty_cache()
-                        print("  [val %s @%d] skipped -- CUDA OOM (%s). Training is unaffected."
-                              % (source, long_side, str(exc).split("\n")[0]))
-                prefix = "val_%s_L%d_" % (source, long_side)
-                record.update({prefix + k: round(metrics[k], 5) if k in metrics else float("nan")
-                               for k in val_keys})
-                if metrics:
-                    print("  [val vs teacher] %-10s @%4d  mean %.2f px | median %.2f | p90 %.2f | "
-                          "within 1/2/3px %.0f%%/%.0f%%/%.0f%%"
-                          % (source, long_side, metrics["mean_px"], metrics["median_px"],
-                             metrics["p90_px"], 100 * metrics["within1"],
-                             100 * metrics["within2"], 100 * metrics["within3"]))
+        if epoch % cfg["training"]["val_every"] == 0:
+            metrics = validate_all()
+            record.update(metrics)
+            update_best(metrics, "epoch %d" % epoch)
+        else:
+            record.update({"val_%s_L%d_%s" % (s, L, k): float("nan") for s in val_sets
+                           for L in cfg["data"]["val_long_side"] for k in val_keys})
+            record["val_score"] = float("nan")
 
         append_log(ckpt_dir, record)
         print("epoch %d done: total %.4f  (%.1f s)" % (epoch, record.get("total", float("nan")),
@@ -893,6 +991,8 @@ def train(cfg):
             previous_ckpt = out
 
     print("Training complete. Checkpoints in %s" % ckpt_dir)
+    if best["epoch"] is not None:
+        print("Best: %s, val score %.2f%% -> %s" % (best["epoch"], 100 * best["score"], best_pth))
 
 
 def main():
@@ -902,6 +1002,11 @@ def main():
     parser.add_argument("--image_dir", default="", help="override paths.image_dir")
     parser.add_argument("--teacher_ckpt", default="", help="override paths.teacher_ckpt")
     parser.add_argument("--checkpoint_dir", default="", help="override paths.checkpoint_dir")
+    parser.add_argument("--init_from", default=None,
+                        help="override paths.init_from (fine-tune; a file or a run folder; '' clears it)")
+    parser.add_argument("--resume_from", default=None,
+                        help="override paths.resume_from (continue a run; a file or a run folder)")
+    parser.add_argument("--lr", type=float, default=0.0, help="override training.lr")
     parser.add_argument("--epochs", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=0)
     parser.add_argument("--width", type=float, default=0.0, help="override student.width")
@@ -916,6 +1021,12 @@ def main():
         cfg["paths"]["teacher_ckpt"] = args.teacher_ckpt
     if args.checkpoint_dir:
         cfg["paths"]["checkpoint_dir"] = args.checkpoint_dir
+    if args.init_from is not None:
+        cfg["paths"]["init_from"] = args.init_from
+    if args.resume_from is not None:
+        cfg["paths"]["resume_from"] = args.resume_from
+    if args.lr:
+        cfg["training"]["lr"] = args.lr
     if args.epochs:
         cfg["training"]["epochs"] = args.epochs
     if args.batch_size:

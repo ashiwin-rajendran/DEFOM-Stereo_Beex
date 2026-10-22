@@ -54,6 +54,9 @@ above is identical either way.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -386,6 +389,42 @@ def build_student(features=256, width=1.0, fpn_dim=128, depth_dim=64,
                                mobilevit_variant=mobilevit_variant,
                                mobilevit_init_from=mobilevit_init_from, norm=norm,
                                freeze_bn=freeze_bn)
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def resolve_student_checkpoint(path, prefer_best=True):
+    """A file is used as-is. A directory resolves to its student_best.pth --
+    the epoch training picked by validation -- else (or with prefer_best=False,
+    as resuming needs) its highest-epoch student_epoch####.pth. Relative paths
+    that do not exist from the working directory resolve against the
+    repository root."""
+    p = Path(path)
+    if not p.is_absolute() and not p.exists():
+        p = REPO_ROOT / p
+    if p.is_file():
+        return p
+    if prefer_best and (p / "student_best.pth").is_file():
+        return p / "student_best.pth"
+    candidates = sorted(p.glob("student_epoch*.pth"),
+                        key=lambda f: int(re.search(r"(\d+)", f.stem).group(1)))
+    if not candidates:
+        raise FileNotFoundError("No student_best.pth or student_epoch*.pth under %s" % p)
+    return candidates[-1]
+
+
+def load_student(path, device="cpu"):
+    """Returns (student in eval mode, checkpoint dict, resolved path).
+
+    The warm-start path recorded in student_cfg is ignored: every weight comes
+    from the checkpoint itself, and that path need not exist on this machine.
+    """
+    path = resolve_student_checkpoint(path)
+    ck = torch.load(str(path), map_location="cpu", weights_only=True)
+    student = build_student(features=ck["out_dim"], **dict(ck["student_cfg"], mobilevit_init_from=""))
+    student.load_state_dict(ck["student"])
+    return student.to(device).eval(), ck, path
 
 
 def count_parameters(model):
