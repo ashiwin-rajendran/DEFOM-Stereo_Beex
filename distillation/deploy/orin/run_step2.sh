@@ -18,6 +18,9 @@ LOG="$DIR/step2_results.txt"
   nvpmodel -q 2>/dev/null | head -1
   python3 -c "import tensorrt; print('TensorRT', tensorrt.__version__)"
   for onnx in "$DIR"/*.onnx; do
+    if [ ! -f "${onnx%.onnx}.json" ] || [ ! -f "${onnx%.onnx}_reference.npz" ]; then
+      echo; echo "----- $(basename "$onnx"): SKIPPED, its .json or _reference.npz is missing"; continue
+    fi
     for p in $PRECISIONS; do
       engine="${onnx%.onnx}_${p}.engine"
       echo; echo "----- $(basename "$onnx") $p"

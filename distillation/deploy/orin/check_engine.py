@@ -19,6 +19,9 @@ import cv2
 import numpy as np
 import tensorrt as trt
 
+MAX_MEDIAN_PX = 0.5      # median |engine - fp32 PyTorch| disparity
+MIN_WITHIN3 = 0.95       # share of pixels within 3 px of fp32 PyTorch
+
 
 class Cuda:
     """The four CUDA runtime calls needed, via ctypes (no pycuda on the SVC)."""
@@ -146,8 +149,14 @@ def main():
     print("  wrote %s (+ .jpg: left | PyTorch | engine | |diff| 0-3 px)" % check_json.name)
     for ptr in buffers.values():
         cuda.free(ptr)
-    if not all(s["finite"] for s in stats):
-        raise SystemExit("engine output contains NaN/inf")
+    # Same limits as the exporter's fp16 check: a correct engine is within ~0.1 px.
+    bad = [s["frame"] for s in stats
+           if not s["finite"] or not s["median_px"] <= MAX_MEDIAN_PX or not s["within3"] >= MIN_WITHIN3]
+    if bad:
+        raise SystemExit("ACCURACY FAIL on %s (limits: median <= %.1f px, >= %.0f%% within 3 px): this "
+                         "engine is wrong -- check that the model's .json was present when it was built."
+                         % (", ".join(bad), MAX_MEDIAN_PX, 100 * MIN_WITHIN3))
+    print("  ACCURACY OK")
 
 
 if __name__ == "__main__":

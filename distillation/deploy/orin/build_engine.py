@@ -68,8 +68,14 @@ def main():
 
     onnx_path = Path(args.onnx).resolve()
     meta_path = onnx_path.with_suffix(".json")
-    meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
-    fp32_layers = meta.get("fp32_layers", [])
+    if not meta_path.is_file():
+        raise SystemExit("%s is missing: copy it from output_models together with the .onnx. It lists "
+                         "the layers that overflow fp16 (without it an fp16 engine is silently wrong)."
+                         % meta_path.name)
+    meta = json.loads(meta_path.read_text())
+    fp32_layers = meta.get("fp32_layers")
+    if args.precision == "fp16" and not fp32_layers:
+        raise SystemExit("%s has no fp32_layers: re-export with distillation/export_model.py" % meta_path.name)
     engine_path = onnx_path.with_name("%s_%s.engine" % (onnx_path.stem, args.precision))
 
     logger = trt.Logger(trt.Logger.VERBOSE if args.verbose else trt.Logger.WARNING)
