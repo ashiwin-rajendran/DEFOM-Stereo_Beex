@@ -8,7 +8,7 @@ outside the folder they run in is changed.
 |---|---|
 | `build_engine.py` | ONNX -> TensorRT `.engine` for this GPU (fp16 or fp32) |
 | `check_engine.py` | runs an engine on the exporter's reference frames: accuracy vs fp32 PyTorch, latency |
-| `run_step2.sh` | both of the above for every ONNX model in a folder; writes `step2_results.txt` |
+| `run_step2.sh` | both of the above for the models in a folder (or chosen sizes), smallest first; writes `step2_results.txt` |
 | `check_rectification.py` | is the raw 1600x1200 stream rectified? (with or without the `.dwecal` maps) |
 
 ## 1. Engines: speed and accuracy
@@ -17,21 +17,33 @@ On the PC (training repo):
 
 ```bash
 python3 distillation/export_model.py --ckpt distillation/checkpoints/<run> --format onnx \
-    --size 640x480 --size 800x600 --size 1024x768 --size 1600x1200
+    --size 640x480 --size 800x600 --size 1024x768
 scp -r distillation/output_models/<label>_<epoch> distillation/deploy/orin dwe@192.168.4.5:~/defom/
 ```
 
-On the SVC (stop DWE's stream so the GPU is free):
+(The multiscale student is refused at 1600x1200: it was trained on long sides
+of 512-1024 and is numerically unstable there -- two exact-fp32 runs differ by
+0.6 px median -- while the teacher is stable. It needs fine-tuning at that scale.)
+
+Copy the whole folder: every model needs its `.onnx`, `.json` (it lists the
+layers that must stay fp32) and `_reference.npz` side by side. Without the
+`.json` the builder refuses; it used to build an engine that ran but was wrong.
+
+On the SVC (stop DWE's stream so the GPU is free), smallest size first:
 
 ```bash
 cd ~/defom
-bash orin/run_step2.sh <label>_<epoch>                        # fp16 engines, all sizes
-PRECISIONS=fp32 bash orin/run_step2.sh <label>_<epoch>        # optional fp32 reference
+nohup bash orin/run_step2.sh <label>_<epoch> 640x480 800x600 > step2.log 2>&1 &   # chosen sizes, in order
+nohup bash orin/run_step2.sh <label>_<epoch> > step2.log 2>&1 &                   # every size, smallest first
+PRECISIONS=fp32 bash orin/run_step2.sh <label>_<epoch> 640x480                    # optional fp32 reference
+tail -f step2.log
 ```
 
-Each engine build takes several minutes (longer for 1600x1200). Send back
-`<label>_<epoch>/step2_results.txt`; the `*_check.jpg` images show left |
-PyTorch | engine | difference.
+Each build takes a long time on the Orin NX (1024x768: 45 min). Per model it
+writes `<model>_fp16.engine`, `<model>_fp16_engine.json` (build info) and
+`<model>_fp16_check.json/.jpg` (left | PyTorch | engine | difference); each
+check ends with `ACCURACY OK` or `ACCURACY FAIL`. Send back
+`<label>_<epoch>/step2_results.txt` and a `_check.jpg`.
 
 **fp16** runs convolutions, matrix multiplies and activations in fp16 and
 everything else in fp32, like PyTorch mixed precision. The four

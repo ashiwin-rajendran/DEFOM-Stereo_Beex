@@ -108,11 +108,11 @@ def build_model(ckpt):
     return model.eval(), ck, ckpt_path
 
 
-def output_dir(ckpt_path, ck, label):
+def output_dir(ckpt_path, ck, label, root=OUTPUT_ROOT):
     label = label or RUN_LABELS.get(ckpt_path.parent.name, ckpt_path.parent.name)
     epoch = ck.get("epoch")
     tag = ("ep%d" % epoch) if isinstance(epoch, int) else str(epoch).replace("epoch ", "ep").replace(" ", "")
-    return label, OUTPUT_ROOT / ("%s_%s" % (label, tag))
+    return label, Path(root) / ("%s_%s" % (label, tag))
 
 
 def load_frames(width, height, count, images=()):
@@ -402,6 +402,7 @@ def main():
     ap.add_argument("--device", default="cuda", help="torchscript: the deployment device type")
     ap.add_argument("--opset", type=int, default=17)
     ap.add_argument("--label", default="", help="artifact label (default: short run name)")
+    ap.add_argument("--out_root", default=str(OUTPUT_ROOT), help="parent of the <label>_<epoch> output folder")
     ap.add_argument("--images", nargs="*", default=[], help="side-by-side frames for validation")
     ap.add_argument("--val_count", type=int, default=3, help="validation frames per export")
     args = ap.parse_args()
@@ -416,7 +417,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
 
     model, ck, ckpt_path = build_model(args.ckpt)
-    label, out_dir = output_dir(ckpt_path, ck, args.label)
+    label, out_dir = output_dir(ckpt_path, ck, args.label, args.out_root)
     out_dir.mkdir(parents=True, exist_ok=True)
     print("output      : %s" % out_dir)
     for width, height in args.size or [(640, 480)]:

@@ -5,7 +5,8 @@
     python3 build_engine.py defom_multiscale_640x480.onnx --precision fp32
 
 Uses only the TensorRT Python package that ships with JetPack. Writes
-<onnx stem>_<precision>.engine and a .json next to the ONNX file. An engine
+<onnx stem>_<precision>.engine and <onnx stem>_<precision>_engine.json next
+to the ONNX file. An engine
 only runs on the GPU and TensorRT version that built it.
 
 Precision:
@@ -113,7 +114,8 @@ def main():
             "width": meta.get("width"), "height": meta.get("height"), "iters": meta.get("iters"),
             "fp32_layers": fp32_layers, "source": {k: meta.get(k) for k in
                                                    ("source_run", "source_checkpoint", "source_epoch")}}
-    engine_path.with_suffix(".json").write_text(json.dumps(info, indent=2))
+    # <engine>_engine.json: distinct from the TorchScript export's <model>_fp16.json.
+    engine_path.with_name(engine_path.stem + "_engine.json").write_text(json.dumps(info, indent=2))
     print("wrote %s (%.1f MB) in %.0f s" % (engine_path, engine_path.stat().st_size / 1e6, build_s))
 
 

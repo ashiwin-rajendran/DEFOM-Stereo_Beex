@@ -505,6 +505,9 @@ def train(cfg):
     np.random.seed(tcfg["seed"])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if tcfg["tf32"]:   # before any validation, so every score is computed the same way
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     ckpt_dir = Path(paths_cfg["checkpoint_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     with (ckpt_dir / "resolved_config.json").open("w", encoding="utf-8") as handle:
@@ -621,6 +624,12 @@ def train(cfg):
         state = torch.load(paths_cfg["init_from"], map_location=device, weights_only=True)
         student.load_state_dict(state["student"] if "student" in state else state)
         print("Initialised student from %s" % paths_cfg["init_from"])
+        # Score the checkpoint exactly as saved -- before the BatchNorm statistics
+        # are re-estimated on this data -- so student_best.pth only changes if
+        # training beats it, and otherwise stays that checkpoint.
+        if tcfg["validate_start"]:
+            print("Validating the starting checkpoint ...")
+            update_best(validate_all(), "start")
 
     # Before the optimiser and any resume. A loaded student keeps its own
     # output calibration (its heads were trained against it).
@@ -632,9 +641,6 @@ def train(cfg):
         recalibrate_batchnorm(student, loader, teacher_model, n_downsample, device,
                               tcfg["bn_recalibration_batches"])
 
-    if tcfg["tf32"]:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
     teacher_bf16 = bool(tcfg["teacher_bf16"])
     if teacher_bf16 and not (device.type == "cuda" and torch.cuda.is_bf16_supported()):
         print("training.teacher_bf16 ignored: this GPU has no bfloat16 support")
@@ -672,9 +678,8 @@ def train(cfg):
                 scheduler.step()
         print("Resumed from %s at epoch %d" % (paths_cfg["resume_from"], start_epoch))
 
-    # Score the starting weights, so student_best.pth only changes if training
-    # beats them (skipped on a resume whose best.json already matches).
-    if tcfg["validate_start"] and (paths_cfg["init_from"] or (paths_cfg["resume_from"] and best["epoch"] is None)):
+    # A resume whose best.json already matches has scored these weights.
+    if tcfg["validate_start"] and paths_cfg["resume_from"] and best["epoch"] is None:
         print("Validating the starting checkpoint ...")
         update_best(validate_all(), "start")
 

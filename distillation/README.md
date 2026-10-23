@@ -129,6 +129,7 @@ Give every fine-tune its own `--checkpoint_dir`, so an earlier run's
 Validating the starting checkpoint ...
   [val vs teacher] 800x600    @ 512  mean 2.29 px | median 1.91 | p90 4.27 | within 1/2/3px 70%/79%/82%
   new best: start (val score 77.12%) -> student_best.pth
+Re-estimated the statistics of 34 BatchNorm layers from 50 batches
   epoch 0  step  20/2714  total 1.20  idepth 0.11  lr 1.00e-04  (0.62 s/step, 0.00 s waiting for data)
   ...
   new best: epoch 3 (val score 78.40%) -> student_best.pth        # or: best remains ...
@@ -136,7 +137,8 @@ Validating the starting checkpoint ...
 
 - **val score** = mean "within 3 px" over every camera and size; higher is
   better. `student_best.pth` is updated only when it improves — including
-  over the starting checkpoint, so a fine-tune can never make it worse.
+  over the starting checkpoint, scored exactly as saved (before anything is
+  re-estimated), so a fine-tune can never make it worse.
 - **waiting for data** near 0 means the GPU is the limit (expected). If it
   grows, raise `training.num_workers`.
 - Speed: ~0.53 s/step on an RTX 4070, ~0.62 s/step on the Thor
