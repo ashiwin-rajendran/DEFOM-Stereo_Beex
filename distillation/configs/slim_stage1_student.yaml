@@ -1,0 +1,84 @@
+# Slim DEFOM, stage 1: re-distil the student encoder at 0.75x input size (preset v9).
+# Fine-tunes the best multi-scale student so its features stay close to the
+# teacher's when it sees a smaller image; stage 2 (train_slim.py) then trains
+# the slim stereo core on top. For preset v8 set student.input_scale 0.5.
+# Everything else as underwater_vitl.yaml.
+
+run_name: slim_stage1_student_s075
+description: >
+  DEFOM-Stereo encoder distillation on underwater stereo (DWE + Voyis).
+  Label-free: the student matches the frozen teacher's encoder outputs.
+
+paths:
+  image_dir: distillation/datasets/underwater     # one folder per capture session, any camera; rectified
+  teacher_ckpt: checkpoints/defomstereo_vitl_middlebury.pth
+  checkpoint_dir: distillation/checkpoints/slim_stage1_student_s075                       # new folder per run
+  init_from: distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale/student_best.pth  # epoch 20
+  resume_from: ""                                  # only to continue an interrupted run
+
+training:
+  epochs: 10                  # the 40-epoch run gained almost everything in epoch 0
+  batch_size: 4               # stereo pairs per step (8 images through the teacher)
+  lr: 0.0001                  # 3e-4 trained the multi-scale run; lower for fine-tuning
+  min_lr: 0.000001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  num_workers: 4
+  seed: 17
+  checkpoint_every: 1
+  val_fraction: 0.05          # last 5% of each session is held out
+  val_split: temporal         # temporal | random (random leaks near-duplicate frames)
+  val_every: 1
+  val_max_frames: 80          # per camera; 24 was too noisy to pick an epoch
+  validate_start: true        # score the starting checkpoint first; best only changes if beaten
+  amp: true
+  calibration_batches: 8      # teacher output statistics (only for a fresh student)
+  bn_recalibration_batches: 50
+  teacher_bf16: true          # ~1.7x faster teacher; ignored without bf16 (Xavier)
+  tf32: true                  # faster fp32 matmuls, same accuracy (Ampere+)
+
+student:
+  backbone: mobilevit         # MobileViT-S, distillation/mobilevit.py
+  mobilevit_variant: s
+  fpn_dim: 128
+  depth_dim: 64
+  norm: group                 # FPN normalisation; BatchNorm is unstable at batch 2-4
+  freeze_bn: true             # backbone BatchNorm in eval mode: train == deployed function
+  input_scale: 0.75           # the student runs on a 0.75x input (v9; 0.5 for v8)
+  # DINOv3 MobileViT warm start, used only when training from scratch (no init_from).
+  mobilevit_init_from: distillation/checkpoints/pretrained/student_mobilevit_2M_Dinov3_based_epoch0002.pth
+
+data:
+  long_side: [512, 1024]      # per-eye resize range (aspect kept), then the same crop on both eyes
+  crop: [384, 512]            # h, w; multiples of 32
+  balance_sources: true       # equal share per camera ...
+  max_repeat: 4               # ... but no frame more than ~4x per epoch
+  val_long_side: [640, 800]   # whole-frame validation sizes (deployment: 800x600)
+  swap_lr: false              # true if the right eye is in the left half
+  photometric: true
+  brightness: 0.2
+  contrast: 0.2
+  hflip_pair: true            # mirror both eyes and swap them: keeps the pair valid
+
+loss:                         # relative MSE per teacher output (see ANALYSIS.md)
+  w_dfeat: [1.0, 1.0, 1.0]
+  w_left: 1.0
+  w_right: 1.0
+  w_idepth: 1.0
+
+arch:                         # must match the teacher checkpoint
+  dinov2_encoder: vitl
+  idepth_scale: 0.5
+  hidden_dims: [128, 128, 128]
+  corr_implementation: reg
+  corr_levels: 2
+  corr_radius: 4
+  scale_list: [0.125, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+  scale_corr_radius: 2
+  n_downsample: 2
+  context_norm: batch
+  n_gru_layers: 3
+  shared_backbone: false
+  mixed_precision: false
+  valid_iters: 32
+  scale_iters: 8

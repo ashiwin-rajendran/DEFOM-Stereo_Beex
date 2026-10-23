@@ -17,10 +17,13 @@ the measured results, are in [ANALYSIS.md](ANALYSIS.md).
 distillation/
   distill_defom.py      train a student (any cameras / sizes mixed)
   evaluate.py           compare students against the teacher: report + charts
-  export_model.py       export a student: TorchScript (ROS node) / ONNX (TensorRT on the Orin)
+  export_model.py       export a student or slim model: TorchScript (ROS node) / ONNX (TensorRT, Orin)
   defom_student.py      the student model, and checkpoint loading
   mobilevit.py          MobileViT backbone (self-contained copy)
-  configs/underwater_vitl.yaml   the training config
+  slim_stereo.py        slim DEFOM: the whole stereo model made fast for the Orin NX (section 5)
+  teacher_labels.py     precompute the teacher's disparity (slim training)
+  train_slim.py         train the slim stereo core on those labels
+  configs/              underwater_vitl.yaml (student), slim_stage1_student.yaml, slim_stage2.yaml
   ros_tools/            need ROS
       capture_stereo.py   record training frames from a ROS stereo topic
       live_compare.py     teacher vs student side by side on a live ROS stream
@@ -226,6 +229,37 @@ python3 distillation/ros_tools/live_compare.py --student_ckpt distillation/check
 
 Without `--student_ckpt`, both use the multi-scale run's `student_best.pth`
 (epoch 20).
+
+---
+
+## 5. Slim DEFOM: 6-7 Hz at 800x600 on the Orin NX
+
+The student fixed the encoder, but on the Orin NX the rest of DEFOM -- its
+feature/context networks and refinement iterations -- limits 800x600 to
+~1.9 Hz. Slim DEFOM (`slim_stereo.py`) keeps DEFOM's design with a cheaper
+stereo core and student input; presets `v9` (~6 Hz est.) and `v8` (~7 Hz
+est.). Why and how measured: [ANALYSIS.md](ANALYSIS.md#8-slim-defom-for-the-orin-nx).
+Run on the Thor; copy the multi-scale run's `student_best.pth` there first.
+
+```bash
+# stage 1: the student at its smaller input (0.75 for v9; 0.5 for v8 -- edit student.input_scale)
+python3 -u distillation/distill_defom.py --config distillation/configs/slim_stage1_student.yaml 2>&1 | tee slim_stage1.log
+# teacher disparity for every frame (once per dataset; resumable)
+python3 -u distillation/teacher_labels.py --config distillation/configs/slim_stage2.yaml 2>&1 | tee slim_labels.log
+# stage 2: the slim stereo core (student frozen)
+python3 -u distillation/train_slim.py --config distillation/configs/slim_stage2.yaml 2>&1 | tee slim_stage2.log
+# compare with the current student, export for the Orin
+python3 distillation/evaluate.py --models student=distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale@12/4 \
+    slim=distillation/checkpoints/slim_v9 --long_sides 640 800 --out distillation/evaluations/slim_v9
+python3 distillation/export_model.py --ckpt distillation/checkpoints/slim_v9 --format onnx --size 800x600
+```
+
+- Labels: `distillation/datasets/teacher_labels_800/`, ~1 GB per 2,000 frames,
+  ~0.5-1 s per frame. Re-run after adding sessions (only new frames are done).
+- `train_slim.py` resumes with `--resume_from distillation/checkpoints/slim_v9`
+  (add `--epochs N` to extend); `student_best.pth` + `best.json` as before.
+- Slim checkpoints work in `evaluate.py` and `export_model.py` as they are
+  (they run at their own 12/4 iterations unless `name=path@iters/scale` says otherwise).
 
 ---
 

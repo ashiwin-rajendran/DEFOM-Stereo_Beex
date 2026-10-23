@@ -104,10 +104,13 @@ class DefomStudentEncoder(nn.Module):
     """MobileViT-S + FPN, emitting DepthAnythingV2's output tuple."""
 
     def __init__(self, features=256, fpn_dim=128, depth_dim=64, mobilevit_init_from="",
-                 norm="group", freeze_bn=True):
+                 norm="group", freeze_bn=True, input_scale=1.0):
         super().__init__()
         self.out_dim = features
         self.freeze_bn = freeze_bn
+        # Runs on its input shrunk by this factor (rounded to 32): a cheaper
+        # encoder for embedded GPUs. Outputs are still at out_h x out_w.
+        self.input_scale = float(input_scale)
         self.backbone = MobileViTBackbone(init_from=mobilevit_init_from)
         c1, c2, c3, c4 = self.backbone.out_channels
 
@@ -169,6 +172,10 @@ class DefomStudentEncoder(nn.Module):
 
     def forward(self, x, out_h, out_w):
         half = x.shape[0] // 2
+        if self.input_scale != 1.0:
+            # int(): sizes are tensors while tracing for export; fixed per export anyway.
+            h, w = (max(32, int(round(int(v) * self.input_scale / 32)) * 32) for v in x.shape[-2:])
+            x = F.interpolate(x, (h, w), mode="bilinear", align_corners=True)
         f1, f2, f3, f4 = self.backbone(x)
 
         p4 = self.lat4(f4)
@@ -190,13 +197,14 @@ class DefomStudentEncoder(nn.Module):
 
 
 def build_student(features=256, fpn_dim=128, depth_dim=64, mobilevit_init_from="", norm="group",
-                  freeze_bn=True, backbone="mobilevit", mobilevit_variant="s", **_legacy):
+                  freeze_bn=True, backbone="mobilevit", mobilevit_variant="s", input_scale=1.0, **_legacy):
     """Builds the student from a checkpoint's student_cfg. Older checkpoints
     also carry `width` and `mobilevit_scripts_dir`; they are ignored."""
     if backbone != "mobilevit" or mobilevit_variant != "s":
         raise ValueError("only the MobileViT-S student is supported (got %s/%s)" % (backbone, mobilevit_variant))
     return DefomStudentEncoder(features=features, fpn_dim=fpn_dim, depth_dim=depth_dim,
-                               mobilevit_init_from=mobilevit_init_from, norm=norm, freeze_bn=freeze_bn)
+                               mobilevit_init_from=mobilevit_init_from, norm=norm, freeze_bn=freeze_bn,
+                               input_scale=input_scale)
 
 
 def resolve_student_checkpoint(path, prefer_best=True):

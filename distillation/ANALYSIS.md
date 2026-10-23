@@ -7,7 +7,7 @@ Contents: [1 What is distilled](#1-what-is-distilled) ·
 [2 The student](#2-the-student) · [3 The loss](#3-the-loss) ·
 [4 Data and resolution](#4-data-and-resolution) · [5 Numerics](#5-numerics-fp16-bf16-tf32) ·
 [6 Validation and model selection](#6-validation-and-model-selection) ·
-[7 Results](#7-results) · [8 Fine-tuning vs resuming](#fine-tuning-vs-resuming) ·
+[7 Results](#7-results) · [8 Slim DEFOM](#8-slim-defom-for-the-orin-nx) · [Fine-tuning vs resuming](#fine-tuning-vs-resuming) ·
 [9 Limitations and next steps](#9-limitations-and-next-steps)
 
 ---
@@ -196,6 +196,38 @@ Both start from an existing checkpoint, but they mean different things:
 Adding datasets is a fine-tune: `init_from` the best student into a **new**
 `checkpoint_dir`. Resuming would continue an old schedule (and its frozen
 BatchNorm statistics) built for different data.
+
+## 8. Slim DEFOM for the Orin NX
+
+**Measured on the SVC's Orin NX** (TensorRT 8.6.2, `fp16b` precision, 640x480):
+12/4 iterations 341 ms, 16/6 iterations 373 ms; 800x600 12/4: 538 ms. One
+refinement iteration costs ~8 ms; the rest -- student encoder, fnet, cnet --
+is a fixed ~245 ms at 640x480 (70%). DEFOM's fnet and cnet start with a 7x7
+conv and two 64-channel residual blocks at **full input resolution**, and fnet
+runs them on both images: that, not the student, is the bottleneck. Fewer
+iterations: 16/6 loses nothing measurable (-0.4 points vs 24/8), 12/4 -1.7,
+8/3 -3.6. Starting each frame from the previous frame's disparity (warm start)
+was worse than a cold start of equal cost, and DEFOM's update network diverges
+without at least one scale step first.
+
+**Feasibility study** (untrained variants, PC TensorRT time x 7.5 measured
+PC->Orin factor, 800x600, 12/4 iterations):
+
+| variant | est. Orin NX | stereo core |
+|---|---|---|
+| DEFOM as is | 556 ms (1.8 Hz; measured 538) | 16.7 M |
+| fnet/cnet from 1/2 resolution, slim (32/48/64) | 355 ms | 12.3 M |
+| + student input x0.5 | 273 ms | 12.3 M |
+| **v9**: + student x0.75, GRU hidden 64, 2 levels | **~162 ms (~6.2 Hz)** | 4.3 M |
+| **v8**: + student x0.5, GRU hidden 64, 2 levels | **~142 ms (~7.0 Hz)** | 4.3 M |
+
+`v9` keeps more monocular detail and the full-pixel first layer for thin
+objects; `v8` is faster. Neither can reuse DEFOM's stereo-core weights, so
+they are trained by distillation: stage 1 re-distils the student at its new
+input size (features vs the teacher, as before); stage 2 trains the slim core
+to reproduce the full teacher's disparity at every iteration (L1, later
+iterations weighted more). `SlimDEFOM` configured with DEFOM's own sizes and
+weights reproduces DEFOMStereo exactly (`python3 distillation/slim_stereo.py`).
 
 ## 9. Limitations and next steps
 

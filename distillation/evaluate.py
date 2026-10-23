@@ -6,6 +6,12 @@
                  ep20=distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale/student_epoch0020.pth \\
         --out distillation/evaluations/ep20_vs_orig
 
+    # the same student at fewer refinement iterations (name=path@iters/scale_iters):
+    python3 distillation/evaluate.py --models it24=<run>@24/8 it16=<run>@16/6 it12=<run>@12/4
+
+The teacher always runs at --iters/--scale_iters (default: the checkpoints'
+own, 32/8); a model without @ uses the same.
+
 Every model runs end to end -- its student encoder inside the teacher's own
 stereo core -- on the held-out frames of the training split (so nothing it
 trained on), and is compared pixel by pixel against the full teacher. That is
@@ -44,6 +50,7 @@ import argparse
 import collections
 import csv
 import json
+import re
 import time
 
 import cv2
@@ -52,7 +59,8 @@ import torch
 
 from core.defom_stereo import DEFOMStereo
 from core.utils.utils import InputPadder
-from defom_student import load_student
+from defom_student import load_student, resolve_student_checkpoint
+from slim_stereo import load_slim
 from distill_defom import StereoPairDataset, discover_images, load_config, resolve_paths, split_sessions
 
 # Relative-depth-error bands, by disparity as a fraction of image width:
@@ -71,16 +79,23 @@ METRICS = ("within1", "within2", "within3", "epe_mean", "epe_median", "p90",
 
 
 def parse_models(specs):
-    """'name=path' or 'path'. Unnamed models are named after their file."""
+    """'name=path[@iters/scale_iters]' or 'path'. Unnamed models are named after
+    their file. Returns {name: (path, (iters, scale_iters) or None)}."""
     models = collections.OrderedDict()
     for spec in specs:
         name, _, path = spec.partition("=") if "=" in spec else ("", "", spec)
+        iters = None
+        match = re.match(r"^(.*)@(\d+)/(\d+)$", path)
+        if match:
+            path, iters = match.group(1), (int(match.group(2)), int(match.group(3)))
+            if iters[1] > iters[0]:
+                raise SystemExit("%s: scale_iters cannot exceed iters" % spec)
         if not name:
             p = Path(path)
             name = p.stem if p.suffix else p.name
         if name in models:
             raise SystemExit("Duplicate model name %r -- name them with name=path" % name)
-        models[name] = path
+        models[name] = (path, iters)
     return models
 
 
@@ -141,9 +156,16 @@ def frame_metrics(student, teacher, textured):
 
 def run(args, models, cfg, sets, device):
     loaded = collections.OrderedDict()
-    for name, path in models.items():
-        student, ck, resolved = load_student(path, device)
-        loaded[name] = {"student": student, "ck": ck, "path": str(resolved)}
+    for name, (path, model_iters) in models.items():
+        if "slim" in torch.load(str(resolve_student_checkpoint(path)), map_location="cpu", weights_only=True):
+            # A slim DEFOM (train_slim.py) is a whole stereo model: it runs as is,
+            # by default at the iterations it was trained with.
+            slim, ck, resolved = load_slim(path, device)
+            own = (ck["config"]["training"]["iters"], ck["config"]["training"]["scale_iters"])
+            loaded[name] = {"slim": slim, "ck": ck, "path": str(resolved), "iters": model_iters or own}
+        else:
+            student, ck, resolved = load_student(path, device)
+            loaded[name] = {"student": student, "ck": ck, "path": str(resolved), "iters": model_iters}
     def teacher_of(ck):
         path = Path(ck["config"]["paths"]["teacher_ckpt"])
         return (path if path.is_absolute() else ROOT / path).resolve()
@@ -163,6 +185,8 @@ def run(args, models, cfg, sets, device):
     teacher_encoder = model.defomencoder.depth_anything
     iters = args.iters or first["config"]["arch"]["valid_iters"]
     scale_iters = args.scale_iters or first["config"]["arch"]["scale_iters"]
+    for item in loaded.values():
+        item["iters"] = item["iters"] or (iters, scale_iters)
 
     per_frame = collections.defaultdict(list)    # (model, source, L) -> [metrics dict]
     near = collections.defaultdict(list)         # (model, source) -> [(nearness, rel)]
@@ -171,13 +195,15 @@ def run(args, models, cfg, sets, device):
     skipped = 0
     rng = np.random.default_rng(args.seed)
 
-    def disparity(encoder, lp, rp, padder):
-        model.defomencoder.depth_anything = encoder
+    def disparity(encoder, lp, rp, padder, n_iters, net=None):
+        """The teacher's stereo core with `encoder`, or a whole slim model `net`."""
+        if net is None:
+            model.defomencoder.depth_anything = encoder
         if device.type == "cuda":
             torch.cuda.synchronize()
         started = time.time()
         with torch.no_grad():
-            out = padder.unpad(model(lp, rp, iters=iters, scale_iters=scale_iters, test_mode=True))
+            out = padder.unpad((net or model)(lp, rp, iters=n_iters[0], scale_iters=n_iters[1], test_mode=True))
         if device.type == "cuda":
             torch.cuda.synchronize()
         return out[0, 0].float().cpu().numpy(), 1000.0 * (time.time() - started)
@@ -199,8 +225,9 @@ def run(args, models, cfg, sets, device):
                     padder = InputPadder(lp.shape, divis_by=32)
                     lp, rp = padder.pad(lp, rp)
                     try:
-                        teacher, _ = disparity(teacher_encoder, lp, rp, padder)
-                        results = {name: disparity(item["student"], lp, rp, padder)
+                        teacher, _ = disparity(teacher_encoder, lp, rp, padder, (iters, scale_iters))
+                        results = {name: disparity(item.get("student"), lp, rp, padder, item["iters"],
+                                                   net=item.get("slim"))
                                    for name, item in loaded.items()}
                     except torch.cuda.OutOfMemoryError:
                         torch.cuda.empty_cache()
@@ -225,7 +252,7 @@ def run(args, models, cfg, sets, device):
         model.defomencoder.depth_anything = teacher_encoder
     meta = {"teacher_ckpt": str(first["config"]["paths"]["teacher_ckpt"]), "iters": iters,
             "scale_iters": scale_iters, "skipped": skipped,
-            "models": {n: {"path": i["path"], "epoch": i["ck"].get("epoch"),
+            "models": {n: {"path": i["path"], "epoch": i["ck"].get("epoch"), "iters": list(i["iters"]),
                            "val_score": i["ck"].get("val_score")} for n, i in loaded.items()}}
     return per_frame, near, timing, samples, meta
 
@@ -401,8 +428,13 @@ def charts(out, models, lines, table, bands, sources, run_logs):
         axes[0].grid(alpha=0.3)
         for k in keys:
             vals = [100 * as_float(r.get(k)) for r in rows]
-            source, _, long_side = k[4:-8].rpartition("_L")
-            axes[1].plot(epochs, vals, "-", alpha=0.6, label=line_label((source, int(long_side))).replace("\n", " "))
+            # val_<camera>_L<size>_within3 (distill_defom.py) or val_<camera>_within3 (train_slim.py)
+            source, sep, long_side = k[4:-8].rpartition("_L")
+            if not sep or not long_side.isdigit():
+                source, long_side = k[4:-8], ""
+            label = (line_label((source, int(long_side))) if long_side
+                     else line_label((source, 0)).split(" @")[0])
+            axes[1].plot(epochs, vals, "-", alpha=0.6, label=label.replace("\n", " "))
         # Same score the trainer selects by; NaN for epochs without validation.
         mean = [np.mean([100 * as_float(r.get(k)) for k in keys]) for r in rows]
         axes[1].plot(epochs, mean, "k-", linewidth=2, label="mean (selection score)")
@@ -544,6 +576,7 @@ def write_outputs(out, models, lines, table, overall, paired, bands, timing, met
         pb = "--" if name == args.reference else "%.0f%%" % (100 * paired[name]["p_better"])
         info = meta["models"][name]
         epoch = info["epoch"] if isinstance(info["epoch"], str) else "epoch %s" % info["epoch"]
+        epoch += ", %d/%d iters" % tuple(info["iters"])
         L.append("| %d | `%s` | **%.1f%%** (%.1f-%.1f) | %s | %s | %.2f%% | %.0f | %s (%s) |"
                  % (rank, name, 100 * o["score"], 100 * o["lo"], 100 * o["hi"], cmp_, pb, rel,
                     np.mean(timing[(name, big)]), Path(info["path"]).name, epoch))
@@ -601,7 +634,7 @@ def as_float(value):
 
 def read_run_logs(models):
     logs = collections.OrderedDict()
-    for path in models.values():
+    for path, _ in models.values():
         p = Path(path)
         if not p.is_absolute() and not p.exists():
             p = ROOT / p
@@ -627,7 +660,7 @@ def main():
                     help="heldout: the training split's validation frames; all: every frame (new data)")
     ap.add_argument("--max_frames", type=int, default=80, help="per source (camera), evenly spaced")
     ap.add_argument("--long_sides", type=int, nargs="+", default=[512, 640])
-    ap.add_argument("--iters", type=int, default=0, help="default: the checkpoints' own valid_iters")
+    ap.add_argument("--iters", type=int, default=0, help="teacher (and models without @); default: the checkpoints' own valid_iters")
     ap.add_argument("--scale_iters", type=int, default=0)
     ap.add_argument("--reference", default="", help="model the others are compared to (default: first)")
     ap.add_argument("--samples", type=int, default=3, help="sample frames per source in the images")

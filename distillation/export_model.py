@@ -6,15 +6,17 @@
 
     # ONNX for TensorRT on the Orin (the .engine is built there: deploy/orin/)
     python3 distillation/export_model.py --ckpt distillation/checkpoints/<run> --format onnx \\
-        --size 1600x1200 --size 1024x768 --size 800x600 --size 640x480
+        --size 800x600 --size 640x480 --iters 16 --scale_iters 6
 
 --ckpt takes a run folder (its student_best.pth) or a .pth file. Artifacts go
 to distillation/output_models/<label>_<epoch>/:
 
-    defom_<label>_<W>x<H>_<fp16|fp32>.pt  + .json    TorchScript
-    defom_<label>_<W>x<H>.onnx            + .json    ONNX (fp32 weights; precision is chosen
-    defom_<label>_<W>x<H>_reference.npz              when the engine is built) + test frames
-                                                     and expected output for the Orin check
+    defom_<label>_<W>x<H><it>_<fp16|fp32>.pt + .json   TorchScript
+    defom_<label>_<W>x<H><it>.onnx           + .json   ONNX (fp32 weights; precision is chosen
+    defom_<label>_<W>x<H><it>_reference.npz            when the engine is built) + test frames
+                                                       and expected output for the Orin check
+
+<it> is empty at the default 24/8 iterations, else e.g. _it16s6 (--iters 16 --scale_iters 6).
 
 The model takes left and right RGB images (float, 0-255, NCHW) at exactly
 W x H and returns disparity in pixels at W x H. Every artifact is checked on
@@ -45,7 +47,7 @@ import torch.nn.functional as F
 
 from core.defom_stereo import DEFOMStereo
 import core.corr as defom_corr
-from defom_student import load_student
+from defom_student import load_student, resolve_student_checkpoint
 
 OUTPUT_ROOT = ROOT / "distillation" / "output_models"
 DATASETS = ROOT / "distillation" / "datasets"
@@ -89,7 +91,15 @@ class DeployWrapper(torch.nn.Module):
 
 
 def build_model(ckpt):
-    """DEFOM with the student swapped in for the teacher encoder, on the CPU."""
+    """The model to export, on the CPU: a slim DEFOM checkpoint as is (train_slim.py),
+    or DEFOM with a distilled student swapped in for the teacher encoder."""
+    path = resolve_student_checkpoint(ckpt)
+    if "slim" in torch.load(str(path), map_location="cpu", weights_only=True):
+        from slim_stereo import load_slim
+        model, ck, ckpt_path = load_slim(path, "cpu")
+        model.mixed_precision = False
+        print("checkpoint  : %s (slim DEFOM %s, epoch %s)" % (ckpt_path, ck.get("preset"), ck.get("epoch")))
+        return model, ck, ckpt_path
     student, ck, ckpt_path = load_student(ckpt, "cpu")
     recorded = Path(ck["config"]["paths"]["teacher_ckpt"])
     teacher = recorded if recorded.is_absolute() else ROOT / recorded
@@ -170,6 +180,11 @@ def check(stats, limit, what):
                          "nothing written." % (what, worst, limit))
 
 
+def iters_tag(args):
+    """'' at the default 24/8 iterations, else e.g. '_it16s6', so variants don't overwrite each other."""
+    return "" if (args.iters, args.scale_iters) == (24, 8) else "_it%ds%d" % (args.iters, args.scale_iters)
+
+
 def write_json(path, meta):
     tmp = Path(str(path) + ".tmp")
     tmp.write_text(json.dumps(meta, indent=2))
@@ -220,7 +235,7 @@ def export_torchscript(model, ck, ckpt_path, label, out_dir, width, height, args
         latency = time_it(lambda: traced(*example), device)
     print("  latency on this device: %.0f ms (%.1f Hz)" % (latency, 1000 / latency))
 
-    name = "defom_%s_%dx%d_%s" % (label, width, height, precision)
+    name = "defom_%s_%dx%d%s_%s" % (label, width, height, iters_tag(args), precision)
     pt_path = out_dir / (name + ".pt")
     torch.jit.save(traced, str(pt_path) + ".tmp")
     meta = dict(source_meta(ckpt_path, ck, label, width, height, args), name=name, format="torchscript",
@@ -326,7 +341,7 @@ def export_onnx(model, ck, ckpt_path, label, out_dir, width, height, args):
     fp32_layers, peaks = fp16_unsafe_layers(wrapper, frames, device)
     print("  fp16-unsafe layers (kept fp32 by the Orin builder): %s" % peaks)
 
-    name = "defom_%s_%dx%d" % (label, width, height)
+    name = "defom_%s_%dx%d%s" % (label, width, height, iters_tag(args))
     onnx_path = out_dir / (name + ".onnx")
     tmp_path = str(onnx_path) + ".tmp"
     with OnnxRewrites(model), torch.no_grad():
@@ -397,8 +412,9 @@ def main():
     ap.add_argument("--format", nargs="+", default=["torchscript"], choices=sorted(EXPORTERS) + ["all"])
     ap.add_argument("--size", type=parse_size, action="append", help="WxH, repeatable (default 640x480)")
     ap.add_argument("--half", action="store_true", help="torchscript: fp16 (ONNX precision is set on the Orin)")
-    ap.add_argument("--iters", type=int, default=24, help="refinement iterations baked into the export")
-    ap.add_argument("--scale_iters", type=int, default=8)
+    ap.add_argument("--iters", type=int, default=0,
+                    help="refinement iterations baked into the export (default: 12 for slim models, else 24)")
+    ap.add_argument("--scale_iters", type=int, default=0, help="default: 4 for slim models, else 8")
     ap.add_argument("--device", default="cuda", help="torchscript: the deployment device type")
     ap.add_argument("--opset", type=int, default=17)
     ap.add_argument("--label", default="", help="artifact label (default: short run name)")
@@ -406,8 +422,6 @@ def main():
     ap.add_argument("--images", nargs="*", default=[], help="side-by-side frames for validation")
     ap.add_argument("--val_count", type=int, default=3, help="validation frames per export")
     args = ap.parse_args()
-    if args.scale_iters > args.iters:
-        raise SystemExit("--scale_iters cannot exceed --iters")
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("--device cuda requested but CUDA is unavailable")
     formats = sorted(EXPORTERS) if "all" in args.format else args.format
@@ -417,6 +431,14 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
 
     model, ck, ckpt_path = build_model(args.ckpt)
+    if "slim" in ck:
+        default_iters = (ck["config"]["training"]["iters"], ck["config"]["training"]["scale_iters"])
+    else:
+        default_iters = (24, 8)
+    args.iters = args.iters or default_iters[0]
+    args.scale_iters = args.scale_iters or default_iters[1]
+    if args.scale_iters > args.iters:
+        raise SystemExit("--scale_iters cannot exceed --iters")
     label, out_dir = output_dir(ckpt_path, ck, args.label, args.out_root)
     out_dir.mkdir(parents=True, exist_ok=True)
     print("output      : %s" % out_dir)

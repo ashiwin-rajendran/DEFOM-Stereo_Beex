@@ -89,6 +89,7 @@ def default_config():
             "mobilevit_init_from": "",
             "norm": "group",
             "freeze_bn": True,
+            "input_scale": 1.0,       # <1 trains a cheaper student on a shrunk input (slim DEFOM)
         },
         "data": {
             "long_side": [512, 1024],
@@ -613,7 +614,7 @@ def train(cfg):
     student = build_student(features=out_dim, fpn_dim=sc["fpn_dim"], depth_dim=sc["depth_dim"],
                             backbone=sc["backbone"], mobilevit_variant=sc["mobilevit_variant"],
                             mobilevit_init_from="" if warm_start else sc["mobilevit_init_from"],
-                            norm=sc["norm"], freeze_bn=sc["freeze_bn"]).to(device)
+                            norm=sc["norm"], freeze_bn=sc["freeze_bn"], input_scale=sc["input_scale"]).to(device)
     n_student = count_parameters(student)
     n_teacher = sum(p.numel() for p in teacher_encoder.parameters())
     core = sum(p.numel() for n, p in teacher_model.named_parameters() if not n.startswith("defomencoder"))

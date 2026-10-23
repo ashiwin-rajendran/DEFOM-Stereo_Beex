@@ -2,6 +2,7 @@
 """Build a TensorRT engine from an exported ONNX model, on the device that will run it.
 
     python3 build_engine.py defom_multiscale_640x480.onnx                 # mixed fp16 (default)
+    python3 build_engine.py defom_multiscale_640x480.onnx --precision fp16b
     python3 build_engine.py defom_multiscale_640x480.onnx --precision fp32
 
 Uses only the TensorRT Python package that ships with JetPack. Writes
@@ -15,6 +16,14 @@ Precision:
          else in fp32 -- like PyTorch mixed precision. Coordinate and
          disparity maths stay exact, and the layers the exporter measured
          above fp16's range (the .json's fp32_layers) are kept fp32.
+  fp16b  "balanced": fp16 inside the networks (fnet, cnet, the GRU update
+         blocks, MobileViT -- incl. their normalisation and gating maths),
+         fp32 only where it matters: the blocks around the fp32_layers convs
+         (their normalisation sees ~1e8), the student's output heads (~1e7),
+         LayerNorm layers,
+         and every op at the model's top level -- the correlation lookup,
+         coordinate, disparity-update and upsampling maths. Fewer fp32/fp16
+         conversions: faster, to be confirmed with check_engine.py.
 """
 
 import argparse
@@ -41,6 +50,45 @@ def float_layer(layer):
     return outputs and all(t.dtype in FLOAT_TYPES for t in outputs) and all(t.dtype in FLOAT_TYPES for t in inputs)
 
 
+def balanced_pins(fp32_layers):
+    """fp16b: name tests for the layers kept fp32 (ONNX node names, e.g.
+    '/model/fnet/convd/conv/Conv', '/model/Add_45', '/model/GridSample_3')."""
+    blocks = tuple(p.rstrip("/").rsplit("/", 1)[0] + "/" for p in fp32_layers)   # conv -> its whole block
+    student = "/model/defomencoder/"
+    backbone = "/model/defomencoder/depth_anything/backbone/"
+
+    def pinned(layer):
+        name = layer.name
+        if any(name.startswith(b) for b in blocks):
+            return True
+        if layer.type == trt.LayerType.NORMALIZATION:                 # LayerNorm: sum of squares overflows fp16
+            return True
+        if name.startswith("/model/") and name.count("/") == 2:      # top-level op: coords, corr, disparity
+            return True
+        if name.startswith(student) and not name.startswith(backbone) and layer.type not in FP16_TYPES:
+            return True                                                # student heads, denormalisation
+        return False
+    return pinned
+
+
+def pin_balanced(network, fp32_layers):
+    """fp16b: pin only the layers balanced_pins() selects. Returns (pinned, free)."""
+    test = balanced_pins(fp32_layers)
+    pinned = free = 0
+    for i in range(network.num_layers):
+        layer = network.get_layer(i)
+        if layer.type in FREE_TYPES or not float_layer(layer):
+            continue
+        if test(layer):
+            layer.precision = trt.float32
+            for j in range(layer.num_outputs):
+                layer.set_output_type(j, trt.float32)
+            pinned += 1
+        else:
+            free += 1
+    return pinned, free
+
+
 def pin_fp32(network, fp32_layers):
     """Pin every float-computing layer except FP16_TYPES (and the fp32_layers
     convs) to fp32. Returns (pinned, fp16-eligible) counts."""
@@ -62,7 +110,7 @@ def pin_fp32(network, fp32_layers):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("onnx")
-    ap.add_argument("--precision", choices=["fp16", "fp32"], default="fp16")
+    ap.add_argument("--precision", choices=["fp16", "fp16b", "fp32"], default="fp16")
     ap.add_argument("--workspace_gb", type=float, default=4.0)
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -75,7 +123,7 @@ def main():
                          % meta_path.name)
     meta = json.loads(meta_path.read_text())
     fp32_layers = meta.get("fp32_layers")
-    if args.precision == "fp16" and not fp32_layers:
+    if args.precision != "fp32" and not fp32_layers:
         raise SystemExit("%s has no fp32_layers: re-export with distillation/export_model.py" % meta_path.name)
     engine_path = onnx_path.with_name("%s_%s.engine" % (onnx_path.stem, args.precision))
 
@@ -91,12 +139,13 @@ def main():
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(args.workspace_gb * (1 << 30)))
-    if args.precision == "fp16":
+    if args.precision != "fp32":
         if not builder.platform_has_fast_fp16:
             print("note: this GPU has no fast fp16")
         config.set_flag(trt.BuilderFlag.FP16)
         config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-        pinned, eligible = pin_fp32(network, fp32_layers)
+        pin = pin_balanced if args.precision == "fp16b" else pin_fp32
+        pinned, eligible = pin(network, fp32_layers)
         print("layers: %d total, %d may run fp16, %d pinned fp32 (incl. %s)"
               % (network.num_layers, eligible, pinned, ", ".join(fp32_layers) or "none"))
 

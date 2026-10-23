@@ -2,8 +2,8 @@
 # Build and check a TensorRT engine for the exported ONNX models in a folder,
 # smallest size first.
 #
-#   bash run_step2.sh <folder>                        # every size
-#   bash run_step2.sh <folder> 640x480 800x600        # only these sizes, in this order
+#   bash run_step2.sh <folder>                        # every model, smallest first
+#   bash run_step2.sh <folder> 640x480 800x600_it16s6 # models whose name contains these, in this order
 #   PRECISIONS="fp16 fp32" bash run_step2.sh <folder> # also build fp32 (slower)
 #
 # Writes <folder>/step2_results.txt (send this back) plus per-engine
@@ -17,15 +17,16 @@ LOG="$DIR/step2_results.txt"
 
 if [ $# -gt 0 ]; then
   MODELS=()
-  for size in "$@"; do
-    found=("$DIR"/*_"$size".onnx)
-    [ -f "${found[0]}" ] || { echo "no ONNX model for $size in $DIR"; exit 1; }
-    MODELS+=("${found[0]}")
+  for pattern in "$@"; do
+    found=("$DIR"/*"$pattern"*.onnx)
+    [ -f "${found[0]}" ] || { echo "no ONNX model matching '$pattern' in $DIR"; exit 1; }
+    MODELS+=("${found[@]}")
   done
 else
-  # Every model, ordered by pixel count (the size is the last _WxH of the name).
+  # Every model, ordered by pixel count (the WxH in its name), then name.
   mapfile -t MODELS < <(for f in "$DIR"/*.onnx; do
-    s="${f##*_}"; s="${s%.onnx}"; echo "$(( ${s%x*} * ${s#*x} )) $f"; done | sort -n | cut -d' ' -f2-)
+    s=$(basename "$f" | grep -oE '[0-9]+x[0-9]+' | head -1)
+    echo "$(( ${s%x*} * ${s#*x} )) $f"; done | sort -n -k1,1 -k2 | cut -d' ' -f2-)
 fi
 
 {
