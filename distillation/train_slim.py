@@ -245,6 +245,25 @@ def main():
         d.update(extra or {})
         return d
 
+    def keep_if_best(metrics, label):
+        nonlocal best
+        score = metrics["val_score"]
+        if score == score and score > best["score"]:
+            best = {"score": score, "epoch": label, "signature": signature, "metrics": metrics}
+            atomic_save(payload(label, {"val_score": score}), best_pth)
+            tmp = Path(str(best_json) + ".tmp")
+            tmp.write_text(json.dumps(best, indent=2))
+            os.replace(str(tmp), str(best_json))
+            print("  new best: %s (val score %.2f%%)" % (label, 100 * score))
+        else:
+            print("  best remains %s (%.2f%%)" % (best["epoch"], 100 * best["score"]))
+
+    # A fine-tune scores its starting model first, so student_best.pth only
+    # changes if training beats it.
+    if init and not resume and best["epoch"] is None:
+        print("Validating the starting checkpoint ...")
+        keep_if_best(validate(model, val_sets, cfg, device, t["iters"], t["scale_iters"]), "start")
+
     # The newest epoch on disk keeps its optimizer state until the next one is saved.
     previous = Path(src) if resume and Path(src).parent.resolve() == ckpt_dir.resolve() else None
     for epoch in range(start_epoch, t["epochs"]):
@@ -275,16 +294,7 @@ def main():
         if epoch % t["val_every"] == 0 or epoch == t["epochs"] - 1:
             metrics = validate(model, val_sets, cfg, device, t["iters"], t["scale_iters"])
             record.update(metrics)
-            score = metrics["val_score"]
-            if score == score and score > best["score"]:
-                best = {"score": score, "epoch": "epoch %d" % epoch, "signature": signature, "metrics": metrics}
-                atomic_save(payload("epoch %d" % epoch, {"val_score": score}), best_pth)
-                tmp = Path(str(best_json) + ".tmp")
-                tmp.write_text(json.dumps(best, indent=2))
-                os.replace(str(tmp), str(best_json))
-                print("  new best: epoch %d (val score %.2f%%)" % (epoch, 100 * score))
-            else:
-                print("  best remains %s (%.2f%%)" % (best["epoch"], 100 * best["score"]))
+            keep_if_best(metrics, "epoch %d" % epoch)
         append_log(ckpt_dir, record)
         out = ckpt_dir / ("student_epoch%04d.pth" % epoch)
         atomic_save(payload(epoch, {"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()}), out)

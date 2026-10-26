@@ -1,0 +1,70 @@
+# Slim DEFOM, stage 3 (optional): joint fine-tune. Starts from the stage-2
+# result and unfreezes the student at a low learning rate, so encoder and slim
+# stereo core adapt to each other. The starting model is scored first;
+# student_best.pth only changes if training beats it.
+#   python3 distillation/train_slim.py --config distillation/configs/slim_stage3_joint.yaml
+# Same labels as stage 2 (no new teacher_labels.py run needed).
+
+run_name: slim_v9_joint
+description: >
+  Slim DEFOM v9 for the SVC Orin NX: stride-2 stem, slim fnet/cnet, 0.75x
+  student input, GRU hidden 64 with 2 levels. Distilled from the full DEFOM
+  teacher's disparity on underwater stereo; no labels required.
+
+paths:
+  image_dir: distillation/datasets/underwater
+  teacher_ckpt: checkpoints/defomstereo_vitl_middlebury.pth
+  labels_dir: distillation/datasets/teacher_labels_800       # written by teacher_labels.py
+  student_ckpt: distillation/checkpoints/slim_stage1_student_s075   # stage-1 run (its student_best.pth)
+  checkpoint_dir: distillation/checkpoints/slim_v9_joint
+  init_from: distillation/checkpoints/slim_v9   # stage-2 run (its student_best.pth)
+  resume_from: ""             # only to continue an interrupted run
+
+slim:
+  preset: v9                  # v9 | v8 (student input scale must match stage 1: 0.75 | 0.5)
+
+training:
+  epochs: 10
+  batch_size: 6
+  lr: 0.00005                 # lower than stage 2: refining, not learning from scratch
+  min_lr: 0.000001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  num_workers: 4
+  seed: 17
+  iters: 12                   # as deployed
+  scale_iters: 4
+  gamma: 0.9                  # sequence loss: later iterations weigh more
+  freeze_student: false       # the student trains too, at student_lr
+  student_lr: 0.00001
+  amp: true
+  val_fraction: 0.05
+  val_split: temporal
+  val_every: 1
+  val_max_frames: 80
+
+data:
+  label_long_side: 800        # teacher labels and training frames at the deployment scale
+  crop: [384, 640]            # h, w; multiples of 32
+  scale_jitter: [0.8, 1.25]   # random rescale of frame and label (disparity scaled with it)
+  swap_lr: false
+  photometric: true
+  brightness: 0.2
+  contrast: 0.2
+
+arch:                         # the teacher's, unchanged
+  dinov2_encoder: vitl
+  idepth_scale: 0.5
+  hidden_dims: [128, 128, 128]
+  corr_implementation: reg
+  corr_levels: 2
+  corr_radius: 4
+  scale_list: [0.125, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+  scale_corr_radius: 2
+  n_downsample: 2
+  context_norm: batch
+  n_gru_layers: 3
+  shared_backbone: false
+  mixed_precision: false
+  valid_iters: 32
+  scale_iters: 8
