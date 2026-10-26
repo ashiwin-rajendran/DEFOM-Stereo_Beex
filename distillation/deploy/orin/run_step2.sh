@@ -4,7 +4,7 @@
 #
 #   bash run_step2.sh <folder>                        # every model, smallest first
 #   bash run_step2.sh <folder> 640x480 800x600_it16s6 # models whose name contains these, in this order
-#   PRECISIONS="fp16 fp32" bash run_step2.sh <folder> # also build fp32 (slower)
+#   PRECISIONS="fp16b fp32" bash run_step2.sh <folder> # also an fp32 reference (slower)
 #
 # Writes <folder>/step2_results.txt (send this back) plus per-engine
 # _check.json/_check.jpg. Existing engines are reused; delete one to rebuild.
@@ -12,7 +12,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DIR="${1:?usage: run_step2.sh <folder with the exported models> [WxH ...]}"
 shift
-PRECISIONS="${PRECISIONS:-fp16}"
+PRECISIONS="${PRECISIONS:-fp16b}"
 LOG="$DIR/step2_results.txt"
 
 if [ $# -gt 0 ]; then

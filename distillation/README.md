@@ -23,7 +23,8 @@ distillation/
   slim_stereo.py        slim DEFOM: the whole stereo model made fast for the Orin NX (section 5)
   teacher_labels.py     precompute the teacher's disparity (slim training)
   train_slim.py         train the slim stereo core on those labels
-  configs/              underwater_vitl.yaml (student), slim_stage1_student.yaml, slim_stage2.yaml
+  configs/              underwater_vitl.yaml (student), slim_stage1_student.yaml,
+                        slim_stage2.yaml, slim_stage3_joint.yaml (slim DEFOM)
   ros_tools/            need ROS
       capture_stereo.py   record training frames from a ROS stereo topic
       live_compare.py     teacher vs student side by side on a live ROS stream
@@ -155,13 +156,16 @@ Compare any students against the teacher on held-out frames, with a report:
 
 ```bash
 python3 distillation/evaluate.py \
-    --models orig=distillation/checkpoints/underwater_vitl_middlebury_to_student/student_epoch0049.pth \
-             multiscale=distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale \
-             finetune=distillation/checkpoints/underwater_vitl_middlebury_to_student_finetune \
-    --out distillation/evaluations/finetune_vs_multiscale
+    --models student=distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale \
+             v9=distillation/checkpoints/slim_v9 \
+             v9_joint=distillation/checkpoints/slim_v9_joint \
+    --out distillation/evaluations/<date>_slim_v9_joint
 ```
 
-- A directory picks its `student_best.pth`. Name models `name=path`.
+- A directory picks its `student_best.pth`. Name models `name=path`; students
+  and slim DEFOMs can be mixed (a slim model runs at its own 12/4 iterations).
+- Original fixed-800x600 baseline, if needed:
+  `orig=distillation/checkpoints/underwater_vitl_middlebury_to_student/student_epoch0049.pth`.
 - The first model is the **reference** the others are compared to
   (`--reference` to change it).
 - New dive the students never saw: `--image_dir /path/to/new_sessions --frames all`.
@@ -212,22 +216,25 @@ engine ([deploy/orin/README.md](deploy/orin/README.md)):
 
 ```bash
 python3 distillation/export_model.py --ckpt distillation/checkpoints/<run> --format onnx \
-    --size 640x480 --size 800x600 --size 1024x768 --size 1600x1200
+    --size 800x600 --size 1024x768
 ```
+
+(The student is refused at 1600x1200: it is numerically unstable at sizes it
+never trained on -- see ANALYSIS.md.)
 
 The ONNX export rewrites two ops for TensorRT (einsum -> matmul, unfold ->
 conv; identical maths, checked every time) and records which layers must stay
 fp32. `--device cpu` when the GPU is busy (slower). Needs `pip install onnx
 onnxruntime`.
 
-Check a student live on the robot's stream:
+Check a model live on the robot's stream (a student or a slim DEFOM checkpoint):
 
 ```bash
-python3 demo_v3.py --student_ckpt distillation/checkpoints/<run>        # student as a ROS node
+python3 demo_v3.py --run slim_v9                                     # as a ROS node (or --student_ckpt <run>)
 python3 distillation/ros_tools/live_compare.py --student_ckpt distillation/checkpoints/<run>   # vs teacher, live
 ```
 
-Without `--student_ckpt`, both use the multi-scale run's `student_best.pth`
+Without `--run`/`--student_ckpt`, both use the multi-scale run's `student_best.pth`
 (epoch 20).
 
 ---
@@ -236,9 +243,10 @@ Without `--student_ckpt`, both use the multi-scale run's `student_best.pth`
 
 The student fixed the encoder, but on the Orin NX the rest of DEFOM -- its
 feature/context networks and refinement iterations -- limits 800x600 to
-~1.9 Hz. Slim DEFOM (`slim_stereo.py`) keeps DEFOM's design with a cheaper
-stereo core and student input; presets `v9` (~6 Hz est.) and `v8` (~7 Hz
-est.). Why and how measured: [ANALYSIS.md](ANALYSIS.md#8-slim-defom-for-the-orin-nx).
+1.9 Hz. Slim DEFOM (`slim_stereo.py`) keeps DEFOM's design with a cheaper
+stereo core and student input. Measured on the Orin NX at 800x600 (TensorRT
+fp16b, 12/4 iterations): preset **v9 168 ms (6.0 Hz)**, **v8 148 ms (6.8 Hz)**.
+Why, and how it compares: [ANALYSIS.md](ANALYSIS.md#8-slim-defom-for-the-orin-nx).
 Run on the Thor; copy the multi-scale run's `student_best.pth` there first.
 
 ```bash
@@ -248,14 +256,19 @@ python3 -u distillation/distill_defom.py --config distillation/configs/slim_stag
 python3 -u distillation/teacher_labels.py --config distillation/configs/slim_stage2.yaml 2>&1 | tee slim_labels.log
 # stage 2: the slim stereo core (student frozen)
 python3 -u distillation/train_slim.py --config distillation/configs/slim_stage2.yaml 2>&1 | tee slim_stage2.log
+# stage 3 (optional): joint fine-tune, student unfrozen; keeps the stage-2 model unless beaten
+python3 -u distillation/train_slim.py --config distillation/configs/slim_stage3_joint.yaml 2>&1 | tee slim_stage3.log
 # compare with the current student, export for the Orin
 python3 distillation/evaluate.py --models student=distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale@12/4 \
     slim=distillation/checkpoints/slim_v9 --long_sides 640 800 --out distillation/evaluations/slim_v9
 python3 distillation/export_model.py --ckpt distillation/checkpoints/slim_v9 --format onnx --size 800x600
 ```
 
-- Labels: `distillation/datasets/teacher_labels_800/`, ~1 GB per 2,000 frames,
-  ~0.5-1 s per frame. Re-run after adding sessions (only new frames are done).
+- Durations on the Thor: stage 1 ~25 min/epoch; labels ~0.5-1 s/frame;
+  stage 2 ~26 min/epoch (validation plateaus after ~20-40 epochs; it can be
+  stopped early, `student_best.pth` holds the best); stage 3 ~30 min/epoch.
+- Labels: `distillation/datasets/teacher_labels_800/` (16-bit PNG, disparity x 64).
+  Re-run after adding sessions (only new frames are done).
 - `train_slim.py` resumes with `--resume_from distillation/checkpoints/slim_v9`
   (add `--epochs N` to extend); `student_best.pth` + `best.json` as before.
 - Slim checkpoints work in `evaluate.py` and `export_model.py` as they are
@@ -276,6 +289,10 @@ python3 distillation/export_model.py --ckpt distillation/checkpoints/slim_v9 --f
 | `training.tf32` | true | faster fp32 matmuls, same accuracy |
 | `data.long_side` / `crop` | [512, 1024] / [384, 512] | training scales and crop |
 | `data.balance_sources` / `max_repeat` | true / 4 | equal share per camera, capped |
+| `student.input_scale` | 1.0 (0.75 in slim stage 1) | the student runs on a shrunk input |
+| `slim.preset` | v9 | slim design (`slim_stereo.py` PRESETS) |
+| `training.iters` / `scale_iters` (slim) | 12 / 4 | refinement iterations, as deployed |
+| `training.freeze_student` (slim) | true (false in stage 3) | train the student with the core |
 
 ## Troubleshooting
 

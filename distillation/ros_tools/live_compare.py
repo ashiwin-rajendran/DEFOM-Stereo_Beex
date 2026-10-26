@@ -3,17 +3,17 @@
 
     python3 distillation/ros_tools/live_compare.py [--student_ckpt distillation/checkpoints/<run>]
 
-Runs the full teacher and a distilled student on every frame (one DEFOM
-instance; the student is swapped in for its pass) and publishes:
+Runs the full teacher and a distilled model on every frame and publishes:
 
     <output_ns>/teacher/depth[/compressed]   metric 32FC1 / colourised
     <output_ns>/student/depth[/compressed]   same, on the TEACHER's colour scale
     <compare_topic>                          left | teacher | student
 
 and logs agreement as in training validation (mean/median/p90 px, % within
-1/2/3 px). The stereo core and architecture come from the student checkpoint
-(default: the multi-scale run's student_best.pth). Frames are resized to
---long_side (640, as deployed).
+1/2/3 px). A student checkpoint is swapped into the teacher's own DEFOM (one
+instance); a slim DEFOM checkpoint (train_slim.py) runs as a separate model at
+its own iterations. The teacher comes from the checkpoint (default: the
+multi-scale run's student_best.pth). Frames are resized to --long_side (640).
 """
 
 import sys
@@ -36,7 +36,8 @@ from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from core.defom_stereo import DEFOMStereo
 from core.utils.utils import InputPadder
 from demo_v2 import COLORMAPS, colorise, float_image, load_teacher_weights, repo_path, to_tensor
-from defom_student import load_student
+from defom_student import load_student, resolve_student_checkpoint
+from slim_stereo import load_slim
 
 
 DEFAULT_CKPT_DIR = "distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale"
@@ -59,8 +60,14 @@ class LiveCompareNode(object):
         self.agreement = {"n": 0, "mean": 0.0, "median": 0.0, "p90": 0.0,
                           "w1": 0.0, "w2": 0.0, "w3": 0.0}
 
-        self.student, ck, student_path = load_student(args.student_ckpt, self.device)
-        rospy.loginfo("Loaded student: %s" % student_path)
+        path = resolve_student_checkpoint(args.student_ckpt)
+        self.student = self.slim = None
+        if "slim" in torch.load(str(path), map_location="cpu", weights_only=True):
+            self.slim, ck, student_path = load_slim(path, self.device)
+            self.slim_iters = (ck["config"]["training"]["iters"], ck["config"]["training"]["scale_iters"])
+        else:
+            self.student, ck, student_path = load_student(path, self.device)
+        rospy.loginfo("Loaded %s: %s" % ("slim DEFOM" if self.slim else "student", student_path))
         if args.valid_iters is None:
             args.valid_iters = ck["config"]["arch"]["valid_iters"]
         if args.scale_iters is None:
@@ -74,9 +81,8 @@ class LiveCompareNode(object):
         rospy.loginfo("Teacher ready, %.2f GB" % (torch.cuda.memory_allocated() / 1e9))
 
         self.student_epoch = ck.get("epoch", "?")
-        rospy.loginfo("Student ready: epoch %s, backbone %s, %.1f MB"
-                      % (self.student_epoch, ck["student_cfg"]["backbone"],
-                         sum(p.numel() for p in self.student.parameters()) * 4 / 1e6))
+        rospy.loginfo("Model under test ready: epoch %s, %.1f MB" % (self.student_epoch, sum(
+            p.numel() for p in (self.slim or self.student).parameters()) * 4 / 1e6))
 
         ns = args.output_ns.rstrip("/")
         self.pub_teacher_vis = rospy.Publisher(ns + "/teacher/depth/compressed", CompressedImage, queue_size=1)
@@ -149,14 +155,14 @@ class LiveCompareNode(object):
 
     # ---------------------------------------------------------- inference
 
-    def infer(self, left, right):
+    def infer(self, left, right, model=None, iters=None):
         image1 = to_tensor(left, self.device)
         image2 = to_tensor(right, self.device)
         padder = InputPadder(image1.shape, divis_by=32)
         image1, image2 = padder.pad(image1, image2)
+        iters = iters or (self.args.valid_iters, self.args.scale_iters)
         with torch.no_grad():
-            disp = self.model(image1, image2, iters=self.args.valid_iters,
-                              scale_iters=self.args.scale_iters, test_mode=True)
+            disp = (model or self.model)(image1, image2, iters=iters[0], scale_iters=iters[1], test_mode=True)
         return padder.unpad(disp).cpu().squeeze().numpy().astype(np.float32)
 
     def run_both(self, left, right):
@@ -166,8 +172,11 @@ class LiveCompareNode(object):
         t_teacher = time.time() - started
 
         started = time.time()
-        self.model.defomencoder.depth_anything = self.student
-        disp_student = self.infer(left, right)
+        if self.slim is not None:
+            disp_student = self.infer(left, right, model=self.slim, iters=self.slim_iters)
+        else:
+            self.model.defomencoder.depth_anything = self.student
+            disp_student = self.infer(left, right)
         t_student = time.time() - started
 
         self.model.defomencoder.depth_anything = self.teacher_encoder

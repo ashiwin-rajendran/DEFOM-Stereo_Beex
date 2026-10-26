@@ -2,20 +2,22 @@
 """Evaluate distilled students against the teacher: metrics, charts, report.
 
     python3 distillation/evaluate.py \\
-        --models orig=distillation/checkpoints/underwater_vitl_middlebury_to_student/student_epoch0049.pth \\
-                 ep20=distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale/student_epoch0020.pth \\
-        --out distillation/evaluations/ep20_vs_orig
+        --models student=distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale \\
+                 v9=distillation/checkpoints/slim_v9 \\
+                 v9_joint=distillation/checkpoints/slim_v9_joint \\
+        --out distillation/evaluations/<date>_slim_v9_joint
 
     # the same student at fewer refinement iterations (name=path@iters/scale_iters):
     python3 distillation/evaluate.py --models it24=<run>@24/8 it16=<run>@16/6 it12=<run>@12/4
 
-The teacher always runs at --iters/--scale_iters (default: the checkpoints'
-own, 32/8); a model without @ uses the same.
+A run folder picks its student_best.pth. The teacher always runs at
+--iters/--scale_iters (default: the checkpoints' own, 32/8); a student without
+@ uses the same, a slim DEFOM its own training iterations.
 
-Every model runs end to end -- its student encoder inside the teacher's own
-stereo core -- on the held-out frames of the training split (so nothing it
-trained on), and is compared pixel by pixel against the full teacher. That is
-the question that matters for deployment: how closely does the 94 MB model
+Every model runs end to end -- a student inside the teacher's own stereo core,
+a slim DEFOM as is -- on the held-out frames of the training split (so nothing
+it trained on), and is compared pixel by pixel against the full teacher. That
+is the question that matters for deployment: how closely does the small model
 reproduce the 1530 MB one?
 
 Robustness:
@@ -543,8 +545,8 @@ def write_outputs(out, models, lines, table, overall, paired, bands, timing, met
     best = ranked[0]
     big = max(args.long_sides)
     L = []
-    L.append("# Student evaluation\n")
-    L.append("%s. Every model runs end to end (student encoder + stereo core) on frames it never "
+    L.append("# Model evaluation\n")
+    L.append("%s. Every model runs end to end (a student inside the stereo core, or a slim DEFOM) on frames it never "
              "trained on, compared pixel by pixel with the full teacher (`%s`, %d iterations)."
              % (time.strftime("%Y-%m-%d %H:%M"), meta["teacher_ckpt"], meta["iters"]))
     L.append("")

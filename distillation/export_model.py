@@ -53,7 +53,6 @@ OUTPUT_ROOT = ROOT / "distillation" / "output_models"
 DATASETS = ROOT / "distillation" / "datasets"
 # Short names for the trained runs (others use their folder name).
 RUN_LABELS = {
-    "underwater_vitl_to_student": "sceneflow",
     "underwater_vitl_middlebury_to_student": "middlebury",
     "underwater_vitl_middlebury_to_student_multiscale": "multiscale",
 }

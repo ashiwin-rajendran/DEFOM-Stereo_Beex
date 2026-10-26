@@ -6,7 +6,7 @@ outside the folder they run in is changed.
 
 | file | does |
 |---|---|
-| `build_engine.py` | ONNX -> TensorRT `.engine` for this GPU (fp16 or fp32) |
+| `build_engine.py` | ONNX -> TensorRT `.engine` for this GPU (fp16b, fp16 or fp32) |
 | `check_engine.py` | runs an engine on the exporter's reference frames: accuracy vs fp32 PyTorch, latency |
 | `run_step2.sh` | both of the above for the models in a folder (or chosen sizes), smallest first; writes `step2_results.txt` |
 | `check_rectification.py` | is the raw 1600x1200 stream rectified? (with or without the `.dwecal` maps) |
@@ -36,22 +36,33 @@ cd ~/defom
 nohup bash orin/run_step2.sh <label>_<epoch> 640x480 800x600 > step2.log 2>&1 &   # chosen sizes, in order
 nohup bash orin/run_step2.sh <label>_<epoch> > step2.log 2>&1 &                   # every size, smallest first
 PRECISIONS=fp32 bash orin/run_step2.sh <label>_<epoch> 640x480                    # optional fp32 reference
+PRECISIONS=fp16 bash orin/run_step2.sh <label>_<epoch> 640x480                    # older, slower fp16 mode
 tail -f step2.log
 ```
 
-Each build takes a long time on the Orin NX (1024x768: 45 min). Per model it
-writes `<model>_fp16.engine`, `<model>_fp16_engine.json` (build info) and
-`<model>_fp16_check.json/.jpg` (left | PyTorch | engine | difference); each
+Each build takes a long time on the Orin NX (25-45 min). Per model it
+writes `<model>_fp16b.engine`, `<model>_fp16b_engine.json` (build info) and
+`<model>_fp16b_check.json/.jpg` (left | PyTorch | engine | difference); each
 check ends with `ACCURACY OK` or `ACCURACY FAIL`. Send back
 `<label>_<epoch>/step2_results.txt` and a `_check.jpg`.
 
-**fp16** runs convolutions, matrix multiplies and activations in fp16 and
-everything else in fp32, like PyTorch mixed precision. The four
-convolutions where the depth features enter the stereo core reach ~1e8,
-beyond fp16's 65504; the exporter measures them and lists them in the `.json`
-(`fp32_layers`), and they stay fp32. Measured on an RTX 4070 with TensorRT
-8.6.1 at 640x480: median 0.02-0.12 px from fp32 PyTorch, 99.6-99.9% of pixels
-within 3 px, 129 ms.
+**Precision.** The four convolutions where the depth features enter the
+stereo core reach ~1e8 (beyond fp16's 65504); the exporter measures them per
+model and lists them in the `.json` (`fp32_layers`), and they always stay fp32.
+**fp16b** (default) runs everything else inside the networks in fp16 and keeps
+only the correlation, coordinate and disparity maths, LayerNorm and the
+student's output heads in fp32. **fp16** keeps far more in fp32 and is 2x
+slower at the same accuracy.
+
+Measured on the Orin NX (TensorRT 8.6.2, MAXN); every engine `ACCURACY OK`:
+
+| model | size | iterations | precision | latency |
+|---|---|---|---|---|
+| multi-scale student | 640x480 | 24/8 | fp16 | 749 ms |
+| multi-scale student | 640x480 | 12/4 | fp16b | 341 ms (2.9 Hz) |
+| multi-scale student | 800x600 | 12/4 | fp16b | 538 ms (1.9 Hz) |
+| slim DEFOM v9 | 800x600 | 12/4 | fp16b | 168 ms (6.0 Hz) |
+| slim DEFOM v8 | 800x600 | 12/4 | fp16b | 148 ms (6.8 Hz) |
 
 An engine only runs on the GPU and TensorRT version that built it. A runtime
 loading it must register TensorRT's plugins first

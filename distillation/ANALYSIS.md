@@ -7,7 +7,7 @@ Contents: [1 What is distilled](#1-what-is-distilled) ·
 [2 The student](#2-the-student) · [3 The loss](#3-the-loss) ·
 [4 Data and resolution](#4-data-and-resolution) · [5 Numerics](#5-numerics-fp16-bf16-tf32) ·
 [6 Validation and model selection](#6-validation-and-model-selection) ·
-[7 Results](#7-results) · [8 Slim DEFOM](#8-slim-defom-for-the-orin-nx) · [Fine-tuning vs resuming](#fine-tuning-vs-resuming) ·
+[7 Results](#7-results) · [Fine-tuning vs resuming](#fine-tuning-vs-resuming) · [8 Slim DEFOM](#8-slim-defom-for-the-orin-nx) ·
 [9 Limitations and next steps](#9-limitations-and-next-steps)
 
 ---
@@ -211,35 +211,61 @@ was worse than a cold start of equal cost, and DEFOM's update network diverges
 without at least one scale step first.
 
 **Feasibility study** (untrained variants, PC TensorRT time x 7.5 measured
-PC->Orin factor, 800x600, 12/4 iterations):
+PC->Orin factor, then confirmed on the Orin; 800x600, 12/4 iterations):
 
-| variant | est. Orin NX | stereo core |
+| variant | Orin NX | stereo core |
 |---|---|---|
-| DEFOM as is | 556 ms (1.8 Hz; measured 538) | 16.7 M |
-| fnet/cnet from 1/2 resolution, slim (32/48/64) | 355 ms | 12.3 M |
-| + student input x0.5 | 273 ms | 12.3 M |
-| **v9**: + student x0.75, GRU hidden 64, 2 levels | **~162 ms (~6.2 Hz)** | 4.3 M |
-| **v8**: + student x0.5, GRU hidden 64, 2 levels | **~142 ms (~7.0 Hz)** | 4.3 M |
+| DEFOM as is | 538 ms measured (1.86 Hz) | 16.7 M |
+| fnet/cnet from 1/2 resolution, slim (32/48/64) | ~355 ms est. | 12.3 M |
+| + student input x0.5 | ~273 ms est. | 12.3 M |
+| **v9**: stride-2 stem, slim fnet/cnet, student x0.75, GRU hidden 64, 2 levels | **168 ms measured (6.0 Hz)** | 4.3 M |
+| **v8**: as v9 with student x0.5 | **148 ms measured (6.8 Hz)** | 4.3 M |
 
-`v9` keeps more monocular detail and the full-pixel first layer for thin
-objects; `v8` is faster. Neither can reuse DEFOM's stereo-core weights, so
-they are trained by distillation: stage 1 re-distils the student at its new
-input size (features vs the teacher, as before); stage 2 trains the slim core
-to reproduce the full teacher's disparity at every iteration (L1, later
-iterations weighted more). `SlimDEFOM` configured with DEFOM's own sizes and
-weights reproduces DEFOMStereo exactly (`python3 distillation/slim_stereo.py`).
+v9 keeps more monocular detail and the full-pixel first layer for thin objects;
+v8 is faster. Neither can reuse DEFOM's stereo-core weights, so they are
+trained by distillation: stage 1 re-distils the student at its new input size
+(features vs the teacher, as before); stage 2 trains the slim core to
+reproduce the full teacher's disparity at every iteration (L1, later
+iterations weighted more); optional stage 3 fine-tunes both together.
+`SlimDEFOM` configured with DEFOM's own sizes and weights reproduces
+DEFOMStereo exactly (`python3 distillation/slim_stereo.py`).
+
+**Training v9** (Thor): stage 1 beat its start after one epoch (the student
+loses ~1 point at 0.75x input before fine-tuning). Stage 2 (core from
+scratch) reached 64% validation after 2 epochs, 67% by 8, then plateaued at
+66-69% while training accuracy kept rising (77.6% on crops at epoch 38): best
+epoch 38, 68.7%.
+
+**v9 epoch 38 vs the current student** (`evaluate.py`, 80 Voyis + 80 DWE
+held-out frames, 640 and 800, all vs the teacher):
+
+| | within 3 px overall | Voyis textured | DWE textured | Orin NX 800x600 |
+|---|---|---|---|---|
+| student, 24/8 | 72.8% | 90.6-92.6% | 77.9-79.8% | ~1.2 Hz |
+| student, 12/4 | 71.5% | 90.7-92.7% | 75.8-78.3% | 1.86 Hz |
+| **slim v9, 12/4** | **69.1%** | **89.9-91.2%** | **74.4-75.9%** | **6.0 Hz** |
+
+v9 costs 2.4 points at equal iterations for 3.2x the speed. On structure the
+gap is 1-2.5 points; median relative depth error on structure (disparity 5-30%
+of the width) 0.4-1.0% vs 0.3-0.9%, and v9 is slightly better at very close
+range. Most of the gap is far, textureless water.
 
 ## 9. Limitations and next steps
 
 - **The metric is agreement with the teacher**, not accuracy against ground
-  truth: the student cannot exceed the teacher, and where the teacher is wrong
-  the student is scored for copying it. An absolute check needs ground-truth
-  depth (e.g. a measured object, like the 22 cm limpet mine).
+  truth: a student cannot exceed the teacher, and where the teacher is wrong
+  it is scored for copying it. An absolute check needs a tank rig with known
+  geometry (flat plate at 0.5-1.5 m, 3/5/10 mm cables, holes, a step), which
+  would also compare against DWE's own on-board models.
 - **Open water dominates the remaining gap** and is ill-posed for stereo.
   Masking or down-weighting textureless pixels in the loss is worth trying.
-- **Voyis data is thin** (1,737 frames, 2 sessions). More Voyis sessions are the
-  most direct way to improve the weakest line (Voyis @640).
-- **Raw 1600×1200 DWE frames** should be rectified with the SVC's calibration
-  maps before training on them.
-- Training is GPU-bound on both machines; `teacher_bf16` + `tf32` is the
-  fastest accurate setting.
+- **Voyis data is thin** (1,737 frames, 2 sessions); DWE data is almost all
+  the 800x600 SVC stream.
+- **Raw 1600x1200 DWE frames are not rectified**: the `.dwecal` maps move
+  pixels by a median 6-12 px (eyes differ vertically by a median 2.6 px).
+  Rectify them with the maps before use; `deploy/orin/check_rectification.py`
+  must confirm the maps underwater (the calibration is for water).
+- **1600x1200 inference** is out of reach on the Orin NX (~0.7 s/frame for
+  v9, and the models are unstable beyond their training scales). Deliver
+  1600x1200 by guided upsampling of 800x600 (or 1024x768) disparity.
+- Training is GPU-bound; `teacher_bf16` + `tf32` is the fastest accurate setting.

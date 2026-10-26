@@ -2,7 +2,8 @@
 # disparity (distillation/train_slim.py), on top of the stage-1 student.
 #   1. python3 distillation/teacher_labels.py --config distillation/configs/slim_stage2.yaml
 #   2. python3 distillation/train_slim.py     --config distillation/configs/slim_stage2.yaml
-# Presets (slim_stereo.py): v9 (~6 Hz at 800x600 on the Orin NX, est.) / v8 (~7 Hz).
+#   3. (optional) slim_stage3_joint.yaml: joint fine-tune with the student unfrozen
+# Presets (slim_stereo.py): v9 (6.0 Hz at 800x600 on the Orin NX) / v8 (6.8 Hz).
 
 run_name: slim_v9
 description: >
