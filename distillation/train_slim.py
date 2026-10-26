@@ -264,7 +264,7 @@ def main():
             scaler.update()
             scheduler.step()
             n += 1
-            running.update({"loss": float(loss), "epe": m["epe"], "within3": m["within3"]})
+            running.update({"loss": float(loss.detach()), "epe": m["epe"], "within3": m["within3"]})
             if (step + 1) % 50 == 0:
                 print("  epoch %d step %d/%d  loss %.3f  EPE %.2f px  within3 %.1f%%  lr %.2e  (%.2f s/step)"
                       % (epoch, step + 1, len(loader), running["loss"] / n, running["epe"] / n,
