@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
-"""Export a distilled student (.pth) for deployment.
+"""Export a model (.pth) for deployment.
+
+    # ONNX for TensorRT on the Orin (the .engine is built there: 6_deploy/orin/)
+    python3 distillation/export_model.py --ckpt distillation/3_checkpoints/1_slim_model --format onnx \\
+        --size 800x600 --iters 12 --scale_iters 4
+    python3 distillation/export_model.py --ckpt distillation/3_checkpoints/2_fast_vits_model --format onnx \\
+        --size 512x384 --iters 10 --scale_iters 4
 
     # TorchScript for the ROS node defom_stereo_pointcloud (LibTorch, this PC)
-    python3 distillation/export_model.py --ckpt distillation/checkpoints/<run> --format torchscript --size 640x480 --half
+    python3 distillation/export_model.py --ckpt distillation/3_checkpoints/<run> --format torchscript --size 640x480 --half
 
-    # ONNX for TensorRT on the Orin (the .engine is built there: deploy/orin/)
-    python3 distillation/export_model.py --ckpt distillation/checkpoints/<run> --format onnx \\
-        --size 800x600 --size 640x480 --iters 16 --scale_iters 6
+    # an original DEFOM-Stereo release (encoder from the file name), e.g. the ViT-S RVC model
+    python3 distillation/export_model.py --ckpt checkpoints/defomstereo_vits_rvc.pth --format onnx \\
+        --size 800x600 --iters 12 --scale_iters 4
 
---ckpt takes a run folder (its student_best.pth) or a .pth file. Artifacts go
-to distillation/output_models/<label>_<epoch>/:
+--ckpt takes a run folder (its student_best.pth), a slim / ViT-S .pth, or an original
+defomstereo_<vits|vitb|vitl|vitg>_<data>.pth. Artifacts go to distillation/5_output_models/<run>/,
+named like the checkpoint folder (3_checkpoints/1_slim_model -> 5_output_models/1_slim_model;
+originals: 5_output_models/<vits_rvc>_release/):
 
     defom_<label>_<W>x<H><it>_<fp16|fp32>.pt + .json   TorchScript
     defom_<label>_<W>x<H><it>.onnx           + .json   ONNX (fp32 weights; precision is chosen
@@ -29,9 +37,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "core"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import argparse
@@ -45,16 +50,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from common import DEFOM_ARCH, ROOT
 from core.defom_stereo import DEFOMStereo
 import core.corr as defom_corr
-from defom_student import load_student, resolve_student_checkpoint
+from defom_student import resolve_student_checkpoint
 
-OUTPUT_ROOT = ROOT / "distillation" / "output_models"
-DATASETS = ROOT / "distillation" / "datasets"
+OUTPUT_ROOT = ROOT / "distillation" / "5_output_models"
+DATASETS = ROOT / "distillation" / "1_datasets"
 # Short names for the trained runs (others use their folder name).
 RUN_LABELS = {
-    "underwater_vitl_middlebury_to_student": "middlebury",
-    "underwater_vitl_middlebury_to_student_multiscale": "multiscale",
+    "1_slim_model": "slim_v9_joint",
+    "2_fast_vits_model": "vits_s2_release",
 }
 # Limits on disagreement with fp32 PyTorch, as median |disparity difference| (px).
 # Two exact-fp32 runtimes differ by up to ~0.1 px on some frames: 24 recurrent
@@ -89,39 +95,46 @@ class DeployWrapper(torch.nn.Module):
         return disp
 
 
-def build_model(ckpt):
-    """The model to export, on the CPU: a slim DEFOM checkpoint as is (train_slim.py),
-    or DEFOM with a distilled student swapped in for the teacher encoder."""
-    path = resolve_student_checkpoint(ckpt)
-    if "slim" in torch.load(str(path), map_location="cpu", weights_only=True):
-        from slim_stereo import load_slim
-        model, ck, ckpt_path = load_slim(path, "cpu")
-        model.mixed_precision = False
-        print("checkpoint  : %s (slim DEFOM %s, epoch %s)" % (ckpt_path, ck.get("preset"), ck.get("epoch")))
-        return model, ck, ckpt_path
-    student, ck, ckpt_path = load_student(ckpt, "cpu")
-    recorded = Path(ck["config"]["paths"]["teacher_ckpt"])
-    teacher = recorded if recorded.is_absolute() else ROOT / recorded
-    if not teacher.is_file():
-        teacher = ROOT / "checkpoints" / recorded.name
-    if not teacher.is_file():
-        raise SystemExit("Stereo core %s not found (recorded as %s)" % (teacher, recorded))
-    model = DEFOMStereo(argparse.Namespace(**ck["config"]["arch"]))
-    state = torch.load(str(teacher), map_location="cpu", weights_only=True)
-    model.load_state_dict(state["model"] if "model" in state else state)
-    del state, model.defomencoder.depth_anything
-    model.defomencoder.depth_anything = student
+def build_original(path, state):
+    """An original DEFOM-Stereo release: DEFOM's architecture with the depth encoder
+    named in the file (defomstereo_<vits|vitb|vitl|vitg>_<data>.pth)."""
+    encoder = next((e for e in ("vits", "vitb", "vitl", "vitg") if e in path.stem), None)
+    if encoder is None:
+        raise SystemExit("%s: cannot tell the encoder (vits/vitb/vitl/vitg) from the file name" % path)
+    arch = dict(DEFOM_ARCH, dinov2_encoder=encoder, mixed_precision=False)
+    model = DEFOMStereo(argparse.Namespace(**arch))
+    model.load_state_dict({k[7:] if k.startswith("module.") else k: v for k, v in state.items()})
     model.args.mixed_precision = False
-    print("checkpoint  : %s (epoch %s)" % (ckpt_path, ck.get("epoch")))
-    print("stereo core : %s" % teacher)
-    return model.eval(), ck, ckpt_path
+    ck = {"epoch": "release", "original": True,
+          "config": {"paths": {"teacher_ckpt": str(path)}, "arch": arch},
+          "student_cfg": {"backbone": "dinov2_" + encoder}}
+    print("checkpoint  : %s (original DEFOM-Stereo, %s encoder)" % (path, encoder))
+    return model.eval(), ck, path
+
+
+def build_model(ckpt):
+    """The model to export, on the CPU: a slim DEFOM / ViT-S checkpoint (train_slim.py,
+    train_vits.py, slim_stereo.py --make) or an original DEFOM-Stereo release."""
+    path = resolve_student_checkpoint(ckpt)
+    state = torch.load(str(path), map_location="cpu", weights_only=True)
+    if "slim" not in state:
+        if "config" in state:
+            raise SystemExit("%s is a MobileViT encoder student, no longer supported: export a slim model" % path)
+        return build_original(path, state.get("model", state))
+    from slim_stereo import load_slim
+    model, ck, ckpt_path = load_slim(path, "cpu")
+    model.mixed_precision = False
+    print("checkpoint  : %s (slim DEFOM %s, epoch %s)" % (ckpt_path, ck.get("preset"), ck.get("epoch")))
+    return model, ck, ckpt_path
 
 
 def output_dir(ckpt_path, ck, label, root=OUTPUT_ROOT):
-    label = label or RUN_LABELS.get(ckpt_path.parent.name, ckpt_path.parent.name)
-    epoch = ck.get("epoch")
-    tag = ("ep%d" % epoch) if isinstance(epoch, int) else str(epoch).replace("epoch ", "ep").replace(" ", "")
-    return label, Path(root) / ("%s_%s" % (label, tag))
+    default = ckpt_path.stem.replace("defomstereo_", "") if ck.get("original") else ckpt_path.parent.name
+    label = label or RUN_LABELS.get(ckpt_path.parent.name, default)
+    epoch = ck.get("epoch")                     # "release" for an original
+    if not ck.get("original"):                  # a trained model: the folder is named like its checkpoint folder
+        return label, Path(root) / ckpt_path.parent.name
+    return label, Path(root) / ("%s_%s" % (label, epoch))
 
 
 def load_frames(width, height, count, images=()):
@@ -192,6 +205,7 @@ def write_json(path, meta):
 
 def source_meta(ckpt_path, ck, label, width, height, args):
     return {"label": label, "source_run": ckpt_path.parent.name, "source_checkpoint": ckpt_path.name,
+            "source_path": str(Path(ckpt_path).resolve()), "original_defom": bool(ck.get("original")),
             "source_epoch": ck.get("epoch"), "val_score": ck.get("val_score"),
             "teacher_ckpt": ck["config"]["paths"]["teacher_ckpt"], "backbone": ck["student_cfg"]["backbone"],
             "width": width, "height": height, "iters": args.iters, "scale_iters": args.scale_iters,
@@ -337,6 +351,20 @@ def export_onnx(model, ck, ckpt_path, label, out_dir, width, height, args):
     with torch.no_grad():
         references = [wrapper(to_tensor(l, device), to_tensor(r, device)).float().cpu().numpy()
                       for _, l, r in frames]
+    # PyTorch's own fp16 (autocast) result: how far plain fp16 rounding moves this
+    # model. Some models (e.g. DEFOM ViT-S) amplify it through the iterations; the
+    # Orin check then compares the engine with this instead of a fixed limit.
+    fp16_references, fp16_stats = None, []
+    if device.type == "cuda":
+        model.args.mixed_precision = True
+        with torch.no_grad():
+            fp16_references = [wrapper(to_tensor(l, device), to_tensor(r, device)).float().cpu().numpy()
+                               for _, l, r in frames]
+        model.args.mixed_precision = False
+        for (fname, _, _), out, ref in zip(frames, fp16_references, references):
+            o, r_ = out.ravel(), ref.ravel()
+            fp16_stats.append(dict(compare(o, r_), frame=fname, within3=float((np.abs(o - r_) < 3).mean())))
+        print("  PyTorch fp16 vs fp32: median %s px" % " ".join("%.3f" % st["median_px"] for st in fp16_stats))
     fp32_layers, peaks = fp16_unsafe_layers(wrapper, frames, device)
     print("  fp16-unsafe layers (kept fp32 by the Orin builder): %s" % peaks)
 
@@ -375,17 +403,18 @@ def export_onnx(model, ck, ckpt_path, label, out_dir, width, height, args):
         os.remove(tmp_path)
         raise
 
+    extra = {} if fp16_references is None else {"disparity_fp16": np.concatenate(fp16_references)[:, 0]}
     np.savez_compressed(out_dir / (name + "_reference.npz"),
                         left=np.stack([f[1] for f in frames]), right=np.stack([f[2] for f in frames]),
-                        disparity=np.concatenate(references)[:, 0], frames=np.array([f[0] for f in frames]))
+                        disparity=np.concatenate(references)[:, 0], frames=np.array([f[0] for f in frames]), **extra)
     meta = dict(source_meta(ckpt_path, ck, label, width, height, args), name=name, format="onnx",
                 onnx=onnx_path.name, reference=name + "_reference.npz", opset=args.opset,
                 inputs={"left": [1, 3, height, width], "right": [1, 3, height, width]},
                 outputs={"disparity": [1, 1, height, width]},
                 fp32_layers=fp32_layers, fp32_layer_peaks=peaks,
                 rewrites=["CorrBlock1D.corr: einsum -> matmul", "upsample_flow: unfold -> one-hot conv"],
-                validation_onnxruntime_vs_fp32=stats,
-                notes="Build the TensorRT engine on the target with deploy/orin/build_engine.py; it keeps "
+                validation_onnxruntime_vs_fp32=stats, pytorch_fp16_vs_fp32=fp16_stats,
+                notes="Build the TensorRT engine on the target with 6_deploy/orin/build_engine.py; it keeps "
                       "fp32_layers and all non-conv maths in fp32.")
     os.replace(tmp_path, str(onnx_path))
     write_json(out_dir / (name + ".json"), meta)

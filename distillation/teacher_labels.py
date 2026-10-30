@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Precompute the full DEFOM teacher's disparity for every training frame.
+"""Precompute the DEFOM ViT-L teacher's disparity for every training frame.
 
-    python3 distillation/teacher_labels.py --config distillation/configs/slim_stage2.yaml
+    python3 distillation/teacher_labels.py --config distillation/2_configs/slim_v9_2_finetune.yaml
 
-The slim stereo core (train_slim.py) learns to reproduce these. Each frame is
+train_slim.py and train_vits.py learn from these labels (both configs use the same
+labels_dir, so the labels are made once for both). Each frame is
 resized, aspect kept, to --long_side (default: the config's data.label_long_side,
 800 -- the deployment scale) and the teacher's left disparity is saved as a
 16-bit PNG holding disparity x 64 (1/64 px resolution up to 1023 px, lossless):
@@ -19,9 +20,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "core"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import argparse
@@ -33,8 +31,8 @@ import cv2
 import numpy as np
 import torch
 
+from common import StereoPairDataset, build_teacher, discover_images, load_config, resolve_paths
 from core.utils.utils import InputPadder
-from distill_defom import StereoPairDataset, build_teacher, discover_images, load_config, resolve_paths
 
 LABEL_SCALE = 64.0          # stored value = disparity x 64
 MAX_DISPARITY = 65535 / LABEL_SCALE
@@ -78,11 +76,13 @@ def main():
     print("%d frames, %d already labelled, %d to do -> %s (long side %d, %d/%d iterations)"
           % (len(frames), len(frames) - len(todo), len(todo), labels_dir, long_side, iters, scale_iters))
     labels_dir.mkdir(parents=True, exist_ok=True)
-    meta = {"teacher_ckpt": cfg["paths"]["teacher_ckpt"], "long_side": long_side, "iters": iters,
+    # The teacher by file name: the same labels are used on every machine (PC, Thor).
+    meta = {"teacher_ckpt": Path(cfg["paths"]["teacher_ckpt"]).name, "long_side": long_side, "iters": iters,
             "scale_iters": scale_iters, "encoding": "uint16 PNG, disparity x %g, 0 = invalid" % LABEL_SCALE}
     meta_path = labels_dir / "labels.json"
     if meta_path.is_file():
         old = json.loads(meta_path.read_text())
+        old["teacher_ckpt"] = Path(old.get("teacher_ckpt", "")).name
         if {k: old.get(k) for k in meta} != meta:
             raise SystemExit("%s holds labels made with different settings %s; use another labels_dir"
                              % (labels_dir, old))

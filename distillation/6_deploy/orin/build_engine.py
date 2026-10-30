@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build a TensorRT engine from an exported ONNX model, on the device that will run it.
 
-    python3 build_engine.py defom_multiscale_640x480.onnx                 # fp16b (default)
-    python3 build_engine.py defom_multiscale_640x480.onnx --precision fp16
-    python3 build_engine.py defom_multiscale_640x480.onnx --precision fp32
+    python3 build_engine.py defom_vits_s2_release_512x384_it10s4.onnx                 # fp16b (default)
+    python3 build_engine.py defom_vits_s2_release_512x384_it10s4.onnx --precision fp16
+    python3 build_engine.py defom_vits_s2_release_512x384_it10s4.onnx --precision fp32
 
 Uses only the TensorRT Python package that ships with JetPack. Writes
 <onnx stem>_<precision>.engine and <onnx stem>_<precision>_engine.json next
@@ -118,7 +118,7 @@ def main():
     onnx_path = Path(args.onnx).resolve()
     meta_path = onnx_path.with_suffix(".json")
     if not meta_path.is_file():
-        raise SystemExit("%s is missing: copy it from output_models together with the .onnx. It lists "
+        raise SystemExit("%s is missing: copy it from 5_output_models together with the .onnx. It lists "
                          "the layers that overflow fp16 (without it an fp16 engine is silently wrong)."
                          % meta_path.name)
     meta = json.loads(meta_path.read_text())

@@ -1,0 +1,46 @@
+# Slim DEFOM v9, fine-tune: the deployed slim model (1_slim_model) -- or step 1's run --
+# trained further on the DEFOM ViT-L teacher's disparity, encoder student and stereo core
+# together. Add new sessions (e.g. public datasets) to image_dir, label them, then train.
+#
+#   python3 distillation/teacher_labels.py --config distillation/2_configs/slim_v9_2_finetune.yaml   # new frames only
+#   python3 -u distillation/train_slim.py  --config distillation/2_configs/slim_v9_2_finetune.yaml
+#
+# The starting model is scored first: student_best.pth only changes if training beats it.
+# ~30 min/epoch on the Thor. Give every fine-tune its own checkpoint_dir.
+
+run_name: slim_v9_finetune
+description: >
+  Slim DEFOM v9 (800x600, 5.8 Hz on the Orin NX), fine-tuned jointly on DEFOM ViT-L's
+  disparity.
+
+paths:
+  image_dir: distillation/1_datasets/underwater
+  teacher_ckpt: checkpoints/defomstereo_vitl_middlebury.pth
+  labels_dir: distillation/1_datasets/teacher_labels_800
+  checkpoint_dir: distillation/3_checkpoints/slim_v9_finetune
+  init_from: distillation/3_checkpoints/1_slim_model      # deployed model (or slim_v9_from_vitl after step 1)
+  resume_from: ""
+
+slim:
+  preset: v9
+
+training:
+  epochs: 10
+  batch_size: 6
+  lr: 0.00005                 # refining, not learning from scratch
+  min_lr: 0.000001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  iters: 12                   # as deployed
+  scale_iters: 4
+  gamma: 0.9
+  freeze_student: false       # the encoder student trains too, at student_lr
+  student_lr: 0.00001
+  amp: true
+  val_every: 1
+  val_max_frames: 80
+
+data:
+  label_long_side: 800
+  crop: [384, 640]
+  scale_jitter: [0.8, 1.25]

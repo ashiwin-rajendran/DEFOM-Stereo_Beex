@@ -1,0 +1,46 @@
+# Slim DEFOM v9, step 1 of a fresh model: a new slim stereo core distilled from the
+# DEFOM ViT-L teacher's disparity, on the 0.75x MobileViT encoder student of 1_slim_model (frozen).
+# Step 2 (slim_v9_2_finetune.yaml, init_from this run) then trains both together.
+#
+#   python3 distillation/teacher_labels.py --config distillation/2_configs/slim_v9_1_from_vitl.yaml   # once per dataset
+#   python3 -u distillation/train_slim.py  --config distillation/2_configs/slim_v9_1_from_vitl.yaml
+#
+# ~26 min/epoch on the Thor; validation plateaus after ~20-40 epochs (student_best.pth keeps the best).
+
+run_name: slim_v9_from_vitl
+description: >
+  Slim DEFOM v9 (800x600, 5.8 Hz on the Orin NX): stride-2 slim fnet/cnet, 0.75x
+  MobileViT student input, GRU hidden 64 with 2 levels. Distilled from DEFOM ViT-L.
+
+paths:
+  image_dir: distillation/1_datasets/underwater          # one folder per session; rectified side-by-side frames
+  teacher_ckpt: checkpoints/defomstereo_vitl_middlebury.pth
+  labels_dir: distillation/1_datasets/teacher_labels_800  # teacher_labels.py writes them here
+  student_ckpt: distillation/3_checkpoints/1_slim_model   # its 0.75x encoder student is reused; its core is not
+  checkpoint_dir: distillation/3_checkpoints/slim_v9_from_vitl
+  init_from: ""               # empty: fresh stereo core on student_ckpt
+  resume_from: ""             # only to continue an interrupted run
+
+slim:
+  preset: v9
+
+training:
+  epochs: 60
+  batch_size: 6
+  lr: 0.0002
+  min_lr: 0.000001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  iters: 12                   # as deployed
+  scale_iters: 4
+  gamma: 0.9                  # sequence loss: later iterations weigh more
+  freeze_student: true        # the encoder student stays fixed while the core learns
+  student_lr: 0.00001
+  amp: true
+  val_every: 1
+  val_max_frames: 80          # held-out frames per camera
+
+data:
+  label_long_side: 800        # labels and frames at the deployment scale
+  crop: [384, 640]            # h, w; multiples of 32
+  scale_jitter: [0.8, 1.25]   # random rescale of frame and label (disparity scaled with it)

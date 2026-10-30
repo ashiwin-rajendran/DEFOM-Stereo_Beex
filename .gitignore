@@ -4,7 +4,7 @@ Thumbs.db
 
 # weights, data and reports (copied in, not versioned)
 checkpoints/
-distillation/checkpoints/
-distillation/datasets/
-distillation/evaluations/
-distillation/output_models/
+distillation/3_checkpoints/
+distillation/1_datasets/
+distillation/4_evaluations/
+distillation/5_output_models/

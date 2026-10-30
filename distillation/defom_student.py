@@ -47,43 +47,19 @@ def _conv_bn(inp, oup, stride=1, kernel=3, norm="group"):
 
 
 class MobileViTBackbone(nn.Module):
-    """MobileViT-S, tapped at /4 (64 ch), /8 (96), /16 (128) and /16 (160).
-
-    Layer names match the DINOv3->MobileViT distillation, so its
-    student_mobilevit_*.pth checkpoints warm-start `self.net`. The input is
-    resized up to a multiple of 32: the 2x2 patch unfold on the /16 map needs
-    even sides.
+    """MobileViT-S, tapped at /4 (64 ch), /8 (96), /16 (128) and /16 (160). The input is
+    resized up to a multiple of 32: the 2x2 patch unfold on the /16 map needs even sides.
+    (Layer names match the DINOv3->MobileViT distillation it was first warm-started from.)
     """
 
     MULTIPLE = 32
 
-    def __init__(self, init_from=""):
+    def __init__(self):
         super().__init__()
         from mobilevit import mobilevit_s
 
         self.net = mobilevit_s()
         self.out_channels = (64, 96, 128, 160)
-        if init_from:
-            self.load_pretrained(init_from)
-
-    def load_pretrained(self, path):
-        """Warm start from a DINOv3-distilled MobileViT .pth (not the TorchScript .pt).
-        Its conv2 (160 -> 1024 projection) is expected to be unused here."""
-        blob = torch.load(path, map_location="cpu", weights_only=True)
-        if not isinstance(blob, dict):
-            raise TypeError("%s is not a state dict (a TorchScript .pt?) -- use the .pth" % path)
-        state = next((blob[k] for k in ("model_state_dict", "model", "student", "state_dict")
-                      if isinstance(blob.get(k), dict)), blob)
-        state = {k[len("module."):] if k.startswith("module.") else k: v
-                 for k, v in state.items() if isinstance(v, torch.Tensor)}
-        own = self.net.state_dict()
-        loaded = sum(1 for k, v in state.items() if k in own and own[k].shape == v.shape)
-        missing, unexpected = self.net.load_state_dict(state, strict=False)
-        print("[MobileViTBackbone] warm start from %s: %d/%d tensors (missing %d, unexpected %d)"
-              % (path, loaded, len(own), len(missing), len(unexpected)))
-        # A wrong key or variant would otherwise load nothing and still "succeed".
-        if loaded < 0.5 * len(own):
-            raise RuntimeError("Only %d of %d tensors matched: not a MobileViT-S checkpoint" % (loaded, len(own)))
 
     def forward(self, x):
         h, w = x.shape[-2:]
@@ -103,15 +79,14 @@ class MobileViTBackbone(nn.Module):
 class DefomStudentEncoder(nn.Module):
     """MobileViT-S + FPN, emitting DepthAnythingV2's output tuple."""
 
-    def __init__(self, features=256, fpn_dim=128, depth_dim=64, mobilevit_init_from="",
-                 norm="group", freeze_bn=True, input_scale=1.0):
+    def __init__(self, features=256, fpn_dim=128, depth_dim=64, norm="group", freeze_bn=True, input_scale=1.0):
         super().__init__()
         self.out_dim = features
         self.freeze_bn = freeze_bn
         # Runs on its input shrunk by this factor (rounded to 32): a cheaper
         # encoder for embedded GPUs. Outputs are still at out_h x out_w.
         self.input_scale = float(input_scale)
-        self.backbone = MobileViTBackbone(init_from=mobilevit_init_from)
+        self.backbone = MobileViTBackbone()
         c1, c2, c3, c4 = self.backbone.out_channels
 
         self.lat4 = nn.Conv2d(c4, fpn_dim, 1)
@@ -139,8 +114,8 @@ class DefomStudentEncoder(nn.Module):
         # Output calibration: heads predict standardised values, mapped back to
         # the teacher's range here. The teacher's outputs span five orders of
         # magnitude (matching features ~1e7); without this the large terms get
-        # ~1e-4 gradients and never train. Set by set_output_scales(), saved
-        # with the checkpoint.
+        # ~1e-4 gradients and never train. Measured from the teacher before the
+        # student was trained; saved with the checkpoint.
         for name in ("rn1", "rn2", "rn3", "fuse", "depth"):
             self.register_buffer("%s_shift" % name, torch.zeros(1))
             self.register_buffer("%s_scale" % name, torch.ones(1))
@@ -148,7 +123,7 @@ class DefomStudentEncoder(nn.Module):
     def train(self, mode=True):
         """With freeze_bn, the backbone's BatchNorm stays in eval mode so training
         optimises the same function that is deployed (unfrozen: 19-22% gap).
-        Its statistics are re-estimated before training (distill_defom.py)."""
+        Its statistics were re-estimated before training."""
         super().train(mode)
         if mode and self.freeze_bn:
             for module in self.modules():
@@ -158,13 +133,6 @@ class DefomStudentEncoder(nn.Module):
 
     def _denorm(self, x, name):
         return x * getattr(self, "%s_scale" % name) + getattr(self, "%s_shift" % name)
-
-    @torch.no_grad()
-    def set_output_scales(self, stats):
-        """stats: {'rn1': (mean, std), ...} measured from the teacher."""
-        for name, (mean, std) in stats.items():
-            getattr(self, "%s_shift" % name).fill_(float(mean))
-            getattr(self, "%s_scale" % name).fill_(max(float(std), 1e-6))
 
     @staticmethod
     def _up_add(top, lateral):
@@ -196,15 +164,14 @@ class DefomStudentEncoder(nn.Module):
         return d_features, fused[:half], fused[half:], idepth
 
 
-def build_student(features=256, fpn_dim=128, depth_dim=64, mobilevit_init_from="", norm="group",
-                  freeze_bn=True, backbone="mobilevit", mobilevit_variant="s", input_scale=1.0, **_legacy):
-    """Builds the student from a checkpoint's student_cfg. Older checkpoints
-    also carry `width` and `mobilevit_scripts_dir`; they are ignored."""
+def build_student(features=256, fpn_dim=128, depth_dim=64, norm="group", freeze_bn=True,
+                  backbone="mobilevit", mobilevit_variant="s", input_scale=1.0, **_unused):
+    """Builds the student from a checkpoint's student_cfg. Training-only keys it also
+    carries (mobilevit_init_from, width, ...) are ignored: every weight is in the checkpoint."""
     if backbone != "mobilevit" or mobilevit_variant != "s":
         raise ValueError("only the MobileViT-S student is supported (got %s/%s)" % (backbone, mobilevit_variant))
-    return DefomStudentEncoder(features=features, fpn_dim=fpn_dim, depth_dim=depth_dim,
-                               mobilevit_init_from=mobilevit_init_from, norm=norm, freeze_bn=freeze_bn,
-                               input_scale=input_scale)
+    return DefomStudentEncoder(features=features, fpn_dim=fpn_dim, depth_dim=depth_dim, norm=norm,
+                               freeze_bn=freeze_bn, input_scale=input_scale)
 
 
 def resolve_student_checkpoint(path, prefer_best=True):
@@ -225,22 +192,17 @@ def resolve_student_checkpoint(path, prefer_best=True):
 
 
 def load_student(path, device="cpu"):
-    """Returns (student in eval mode, checkpoint dict, resolved path). Every
-    weight comes from the checkpoint, so its warm-start path is not needed."""
+    """Returns (student in eval mode, checkpoint dict, resolved path) for a student-only checkpoint."""
     path = resolve_student_checkpoint(path)
     ck = torch.load(str(path), map_location="cpu", weights_only=True)
-    student = build_student(features=ck["out_dim"], **dict(ck["student_cfg"], mobilevit_init_from=""))
+    student = build_student(features=ck["out_dim"], **ck["student_cfg"])
     student.load_state_dict(ck["student"])
     return student.to(device).eval(), ck, path
 
 
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
 if __name__ == "__main__":
     model = build_student().eval()
-    n = count_parameters(model)
+    n = sum(p.numel() for p in model.parameters())
     print("mobilevit-s student: %d params, %.1f MB (deployed ~%.1f MB with the 66.8 MB stereo core)"
           % (n, n * 4 / 1e6, n * 4 / 1e6 + 66.8))
     with torch.no_grad():

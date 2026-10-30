@@ -9,6 +9,9 @@ upsampling -- with every expensive part made configurable:
                  its first layers at full resolution; (2,1,2,1) starts at 1/2
     enc_widths   fnet/cnet channel widths (DEFOM: 64, 96, 128)
     student_scale  student encoder input size relative to DEFOM's (1.0)
+    encoder      "student" (the distilled MobileViT, default) or a Depth Anything
+                 v2 ViT ("vits"), as in DEFOM's own releases; vit_scale shrinks
+                 the ViT's input (its outputs keep their size)
     hidden       GRU hidden size (DEFOM: 128), n_gru_layers 2 or 3 (DEFOM: 3)
     motion_out / head   update-block inner widths (DEFOM: 128 / 256)
 
@@ -38,14 +41,21 @@ from core.extractor import ConvBlock, ResidualBlock
 from core.update import BasicMotionEncoder, ConvGRU, DispHead, pool2x, interp
 from core.utils.utils import coords_grid, get_danv2_io_size
 
-# The two designs from the Orin NX study (800x600, 12/4 iterations, TensorRT fp16b).
+# "defom": DEFOM's own sizes (the equivalence check). The two deployed models (Orin NX, TensorRT fp16b):
 PRESETS = {
     "defom": dict(stem=(1, 1, 2, 2), enc_widths=(64, 96, 128), student_scale=1.0,
                   hidden=128, n_gru_layers=3, motion_out=128, head=256),
+    # slim v9: MobileViT student at 0.75x input, stride-2 slim fnet/cnet, GRU 64x2.
+    # 800x600, 12/4 iterations: 172 ms (5.8 Hz)
     "v9": dict(stem=(2, 1, 2, 1), enc_widths=(32, 48, 64), student_scale=0.75,
-               hidden=64, n_gru_layers=2, motion_out=64, head=96),       # 168 ms, 6.0 Hz on Orin NX
-    "v8": dict(stem=(2, 1, 2, 1), enc_widths=(32, 48, 64), student_scale=0.5,
-               hidden=64, n_gru_layers=2, motion_out=64, head=96),       # 148 ms, 6.8 Hz on Orin NX
+               hidden=64, n_gru_layers=2, motion_out=64, head=96),
+    # DEFOM's ViT-S release (defomstereo_vits_rvc.pth) exactly
+    "vits": dict(encoder="vits", stem=(1, 1, 2, 2), enc_widths=(64, 96, 128), vit_scale=1.0,
+                 hidden=128, n_gru_layers=3, motion_out=128, head=256),
+    # the ViT-S release with fnet/cnet from 1/2 resolution; every tensor keeps the release's
+    # shape, so the release's weights load unchanged (--make). 512x384, 10/4: 165 ms (6.05 Hz)
+    "vits_s2": dict(encoder="vits", stem=(2, 1, 2, 1), enc_widths=(64, 96, 128), vit_scale=1.0,
+                    hidden=128, n_gru_layers=3, motion_out=128, head=256),
 }
 
 
@@ -163,10 +173,38 @@ class StudentEncoder(nn.Module):
         return features, left_feat, right_feat, idepth
 
 
+class ViTEncoder(nn.Module):
+    """DEFOM's DefomEncoder (Depth Anything v2 ViT), with its input shrunk by
+    vit_scale. Parameter names match DEFOM's, so its releases load as they are."""
+
+    CONFIGS = {"vits": dict(encoder="vits", features=64, out_channels=[48, 96, 192, 384]),
+               "vitb": dict(encoder="vitb", features=128, out_channels=[96, 192, 384, 768]),
+               "vitl": dict(encoder="vitl", features=256, out_channels=[256, 512, 1024, 1024])}
+
+    def __init__(self, encoder, vit_scale, idepth_scale):
+        super().__init__()
+        from depth_anything_v2.dpt import DepthAnythingV2
+        self.depth_anything = DepthAnythingV2(**self.CONFIGS[encoder])
+        self.vit_scale, self.idepth_scale = float(vit_scale), idepth_scale
+        self.out_dim = self.CONFIGS[encoder]["features"]
+
+    def forward(self, x, io_sizes):
+        ih, iw, oh, ow = io_sizes
+        if self.vit_scale != 1.0:          # multiples of the 14-pixel patch
+            ih, iw = (max(14, int(round(v * self.vit_scale / 14.0)) * 14) for v in (ih, iw))
+        x = F.interpolate(torch.cat(x, dim=0), (ih, iw), mode="bilinear", align_corners=True)
+        features, left_feat, right_feat, idepth = self.depth_anything(x, oh, ow)
+        bs = idepth.shape[0]
+        max_idepth = torch.max(idepth.view(bs, -1), dim=1)[0].detach().view(bs, 1, 1, 1) + 1e-8
+        idepth = idepth / max_idepth * self.idepth_scale * ow + 0.01
+        return features, left_feat, right_feat, idepth
+
+
 class SlimDEFOM(nn.Module):
-    def __init__(self, arch, slim, student):
+    def __init__(self, arch, slim, student=None):
         """arch: DEFOM arch dict (corr, scale_list, n_downsample, ...);
-        slim: a PRESETS entry (or the same keys); student: a DefomStudentEncoder."""
+        slim: a PRESETS entry (or the same keys); student: a DefomStudentEncoder
+        (not used when slim["encoder"] is a ViT)."""
         super().__init__()
         self.arch = argparse.Namespace(**arch)
         self.arch.mixed_precision = False
@@ -175,7 +213,10 @@ class SlimDEFOM(nn.Module):
         hidden = [s["hidden"]] * 3
         self.register_buffer("mean", torch.tensor([[0.485, 0.456, 0.406]])[..., None, None] * 255)
         self.register_buffer("std", torch.tensor([[0.229, 0.224, 0.225]])[..., None, None] * 255)
-        self.defomencoder = StudentEncoder(student, s["student_scale"], a.idepth_scale)
+        if s.get("encoder", "student") == "student":
+            self.defomencoder = StudentEncoder(student, s["student_scale"], a.idepth_scale)
+        else:
+            self.defomencoder = ViTEncoder(s["encoder"], s.get("vit_scale", 1.0), a.idepth_scale)
         d = self.defomencoder.out_dim
         self.fnet = FeatureNet(d, 256, s["enc_widths"], s["stem"])
         self.cnet = ContextNet(d, hidden, s["enc_widths"], s["stem"], norm=a.context_norm)
@@ -191,6 +232,8 @@ class SlimDEFOM(nn.Module):
     def args(self):
         """DEFOMStereo's name for the arch settings (used by the exporter)."""
         return self.arch
+
+    amp_dtype = torch.float16       # autocast precision (training may use torch.bfloat16)
 
     @property
     def mixed_precision(self):
@@ -213,11 +256,17 @@ class SlimDEFOM(nn.Module):
     def forward(self, image1, image2, iters=12, scale_iters=4, test_mode=False):
         """Disparity of image1 (left). test_mode: the final full-resolution
         disparity; otherwise the full-resolution disparity after every iteration."""
+        return self.refine(self.encode(image1, image2), iters, scale_iters, test_mode)
+
+    def encode(self, image1, image2):
+        """Everything before the refinement iterations: a dict with the matching
+        features (fmap1, fmap2, 1/4), the GRU states (net) and context (inp) per
+        level, and the monocular initial disparity (disp, 1/4)."""
         a = self.arch
         image1 = ((image1 - self.mean) / self.std).contiguous()
         image2 = ((image2 - self.mean) / self.std).contiguous()
         h, w = image1.shape[-2:]
-        amp = torch.autocast("cuda", enabled=self.mixed_precision)
+        amp = torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.mixed_precision)
         with amp:
             d_features, dfeat1, dfeat2, disp = self.defomencoder([image1, image2],
                                                                  get_danv2_io_size(h, w, a.n_downsample))
@@ -227,7 +276,14 @@ class SlimDEFOM(nn.Module):
             inp = [torch.relu(x[1]) for x in cnet_list]
             inp = [list(conv(i).split(conv.out_channels // 3, dim=1)) for i, conv in zip(inp, self.context_zqr_convs)]
         inp += [None] * (3 - len(inp))
-        coords = coords_grid(net[0].shape[0], net[0].shape[2], net[0].shape[3])[:, :1].to(image1.device)
+        return {"fmap1": fmap1, "fmap2": fmap2, "net": net, "inp": inp, "disp": disp}
+
+    def refine(self, enc, iters=12, scale_iters=4, test_mode=False, states=None):
+        """The refinement iterations on encode()'s output (see forward). A list
+        passed as states receives the finest GRU state (1/4) after every iteration."""
+        a = self.arch
+        fmap1, fmap2, net, inp, disp = enc["fmap1"], enc["fmap2"], list(enc["net"]), enc["inp"], enc["disp"]
+        coords = coords_grid(net[0].shape[0], net[0].shape[2], net[0].shape[3])[:, :1].to(fmap1.device)
         fmap1, fmap2, disp = fmap1.float(), fmap2.float(), disp.float()
         corr_fn = CorrBlock1D(fmap1, fmap2, coords, radius=a.corr_radius, num_levels=a.corr_levels,
                               scale_list=a.scale_list, scale_corr_radius=a.scale_corr_radius)
@@ -237,14 +293,16 @@ class SlimDEFOM(nn.Module):
             disp = disp.detach()
             if itr < scale_iters:
                 corr = corr_fn(disp, scaling=True)
-                with torch.autocast("cuda", enabled=self.mixed_precision):
+                with torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.mixed_precision):
                     net, up_mask, scale = self.scale_update_block(net, inp, corr, disp)
                 disp = scale.float() * disp
             else:
                 corr = corr_fn(disp, scaling=False)
-                with torch.autocast("cuda", enabled=self.mixed_precision):
+                with torch.autocast("cuda", dtype=self.amp_dtype, enabled=self.mixed_precision):
                     net, up_mask, delta = self.update_block(net, inp, corr, disp)
                 disp = disp + torch.clip(delta.float(), min=-limit, max=limit)
+            if states is not None:
+                states.append(net[0])
             if test_mode and itr < iters - 1:
                 continue
             predictions.append(self.upsample_flow(disp, up_mask.float()))
@@ -255,6 +313,18 @@ def build_slim(arch, slim, student):
     return SlimDEFOM(arch, slim, copy.deepcopy(student))
 
 
+def load_defom_weights(model, path):
+    """Copy every parameter of an original DEFOM-Stereo checkpoint whose name and
+    shape match into model. Returns the names model keeps freshly initialised."""
+    state = torch.load(str(path), map_location="cpu", weights_only=True)
+    state = state.get("model", state)
+    state = {k[7:] if k.startswith("module.") else k: v for k, v in state.items()}
+    own = model.state_dict()
+    same = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape}
+    model.load_state_dict(same, strict=False)
+    return sorted(k for k in own if k not in same)
+
+
 def load_slim(path, device="cpu", prefer_best=True):
     """Returns (SlimDEFOM in eval mode, checkpoint dict, resolved path). A run
     folder gives its student_best.pth (prefer_best=False: its newest epoch)."""
@@ -263,7 +333,9 @@ def load_slim(path, device="cpu", prefer_best=True):
     ck = torch.load(str(path), map_location="cpu", weights_only=True)
     if "slim" not in ck:
         raise ValueError("%s is not a slim DEFOM checkpoint" % path)
-    student = build_student(features=ck["out_dim"], **dict(ck["student_cfg"], mobilevit_init_from=""))
+    student = None
+    if ck["slim"].get("encoder", "student") == "student":
+        student = build_student(features=ck["out_dim"], **ck["student_cfg"])
     model = SlimDEFOM(ck["config"]["arch"], ck["slim"], student)
     model.load_state_dict(ck["model"])
     return model.to(device).eval(), ck, path
@@ -271,11 +343,12 @@ def load_slim(path, device="cpu", prefer_best=True):
 
 def _check_equivalence():
     """SlimDEFOM with DEFOM's sizes and weights must equal DEFOMStereo exactly."""
+    from common import DEFOM_ARCH
     from core.defom_stereo import DEFOMStereo
-    from defom_student import load_student
-    run = REPO / "distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale"
-    student, ck, _ = load_student(str(run))
-    arch = ck["config"]["arch"]
+    from defom_student import build_student
+    torch.manual_seed(0)
+    student = build_student(features=256).eval()      # any encoder: both models get the same one
+    arch = dict(DEFOM_ARCH)
     teacher_core = REPO / "checkpoints/defomstereo_vitl_middlebury.pth"
     state = torch.load(str(teacher_core), map_location="cpu", weights_only=True)
     state = state["model"] if "model" in state else state
@@ -297,15 +370,67 @@ def _check_equivalence():
         a = ref(l, r, iters=12, scale_iters=4, test_mode=True)
         b = slim(l, r, iters=12, scale_iters=4, test_mode=True)
     print("SlimDEFOM('defom') vs DEFOMStereo: max |difference| %.3e px" % (a - b).abs().max().item())
-    for name in ("v9", "v8"):
+    vits = REPO / "checkpoints/defomstereo_vits_rvc.pth"
+    if vits.is_file():
+        varch = dict(arch, dinov2_encoder="vits")
+        ref_s = DEFOMStereo(argparse.Namespace(**varch))
+        st = torch.load(str(vits), map_location="cpu", weights_only=True)
+        ref_s.load_state_dict({k[7:] if k.startswith("module.") else k: v for k, v in st.items()})
+        ref_s.args.mixed_precision = False
+        fast = SlimDEFOM(varch, PRESETS["vits"])
+        fresh = load_defom_weights(fast, vits)
+        ref_s, fast = ref_s.to(dev).eval(), fast.to(dev).eval()
+        with torch.no_grad():
+            d = (ref_s(l, r, iters=12, scale_iters=4, test_mode=True)
+                 - fast(l, r, iters=12, scale_iters=4, test_mode=True)).abs().max().item()
+        print("SlimDEFOM('vits') vs DEFOMStereo ViT-S release: %d fresh tensors, max |difference| %.3e px"
+              % (len(fresh), d))
+        diff_vits = d
+    else:
+        print("(%s not found: ViT-S check skipped)" % vits)
+        diff_vits = 0.0
+    for name in ("v9",):
         m = build_slim(arch, PRESETS[name], student).to(dev).eval()
         with torch.no_grad():
             out = m(l, r, iters=12, scale_iters=4, test_mode=True)
         core = sum(p.numel() for n, p in m.named_parameters() if not n.startswith("defomencoder")) / 1e6
         print("preset %s: output %s, stereo core %.2f M parameters" % (name, tuple(out.shape), core))
-    return float((a - b).abs().max())
+    return max(float((a - b).abs().max()), diff_vits)
+
+
+def make_release_checkpoint(release, preset, out_dir):
+    """A slim-DEFOM checkpoint (loadable by load_slim, export_model.py, evaluate.py) that is an
+    original DEFOM release with unchanged weights in a ViT preset whose tensors all keep the
+    release's shapes -- e.g. vits_s2: fnet/cnet from 1/2 resolution, no training needed."""
+    from common import DEFOM_ARCH
+    encoder = PRESETS[preset].get("encoder")
+    if not encoder:
+        raise SystemExit("preset %s has no ViT encoder" % preset)
+    arch = dict(DEFOM_ARCH, dinov2_encoder=encoder, mixed_precision=False)
+    model = SlimDEFOM(arch, PRESETS[preset])
+    fresh = load_defom_weights(model, release)
+    if fresh:
+        raise SystemExit("preset %s does not fit %s unchanged (%d new tensors, e.g. %s)" % (preset, release, len(fresh), fresh[0]))
+    out = Path(out_dir)
+    if (out / "student_best.pth").exists():
+        raise SystemExit("%s already exists: pass another --out" % (out / "student_best.pth"))
+    out.mkdir(parents=True, exist_ok=True)
+    torch.save({"model": model.state_dict(), "slim": dict(PRESETS[preset]), "preset": preset, "epoch": "release",
+                "out_dim": model.defomencoder.out_dim, "student_cfg": {"backbone": "dinov2_" + encoder},
+                "note": "%s, unchanged weights, preset %s; no training" % (Path(release).name, preset),
+                "config": {"arch": arch, "training": {"iters": 12, "scale_iters": 4},
+                           "paths": {"teacher_ckpt": str(release)}}}, str(out / "student_best.pth"))
+    print("wrote %s" % (out / "student_best.pth"))
 
 
 if __name__ == "__main__":
-    diff = _check_equivalence()
-    print("EQUIVALENT" if diff == 0.0 else "NOT EQUIVALENT")
+    ap = argparse.ArgumentParser(description="Without arguments: check SlimDEFOM against DEFOMStereo.")
+    ap.add_argument("--make", metavar="PRESET", help="write an untrained checkpoint of a release in this preset (vits_s2)")
+    ap.add_argument("--release", default=str(REPO / "checkpoints/defomstereo_vits_rvc.pth"))
+    ap.add_argument("--out", default=str(REPO / "distillation/3_checkpoints/2_fast_vits_model"))
+    a = ap.parse_args()
+    if a.make:
+        make_release_checkpoint(a.release, a.make, a.out)
+    else:
+        diff = _check_equivalence()
+        print("EQUIVALENT" if diff == 0.0 else "NOT EQUIVALENT")

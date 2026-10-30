@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Stage 2 of slim DEFOM: train the slim stereo core on the teacher's disparity.
+"""Train slim DEFOM v9 (slim_stereo.py) on the DEFOM ViT-L teacher's disparity.
 
-    python3 distillation/teacher_labels.py --config distillation/configs/slim_stage2.yaml   # once
-    python3 distillation/train_slim.py     --config distillation/configs/slim_stage2.yaml
+    python3 distillation/teacher_labels.py --config distillation/2_configs/slim_v9_2_finetune.yaml   # labels, once
+    python3 distillation/train_slim.py     --config distillation/2_configs/slim_v9_2_finetune.yaml
 
-The slim model (slim_stereo.py, preset from the config) uses the stage-1
-student encoder (frozen by default) and a freshly initialised slim stereo
-core. Each training sample is a frame at the label scale with the teacher's
-disparity, randomly rescaled (disparity scaled with it) and cropped; the loss
-is L1 to the teacher at every refinement iteration, later ones weighted more.
-Validation runs whole held-out frames and scores the share of pixels within
-3 px of the teacher; the best epoch is kept as student_best.pth + best.json.
+Two starting points (paths in the config):
+  init_from     a slim checkpoint: fine-tune it (slim_v9_2_finetune.yaml, from the
+                deployed 1_slim_model). Its score is taken first, so student_best.pth
+                only changes if training beats it.
+  student_ckpt  (init_from empty) a fresh slim stereo core on the 0.75x MobileViT
+                encoder student taken from this slim checkpoint (or a student-only
+                checkpoint): slim_v9_1_from_vitl.yaml.
+Each training sample is a frame at the label scale with the teacher's disparity,
+randomly rescaled (disparity scaled with it) and cropped; the loss is L1 to the
+teacher at every refinement iteration, later ones weighted more. Validation runs
+whole held-out frames and scores the share of pixels within 3 px of the teacher;
+the best epoch is kept as student_best.pth + best.json.
 """
 
 from __future__ import annotations
@@ -18,9 +23,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "core"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import argparse
@@ -36,10 +38,10 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+from common import (StereoPairDataset, append_log, atomic_save, discover_images, load_config, resolve_paths,
+                    split_sessions, subsample)
 from core.utils.utils import InputPadder
-from defom_student import load_student
-from distill_defom import (StereoPairDataset, append_log, atomic_save, discover_images, load_config,
-                           resolve_paths, split_sessions)
+from defom_student import load_student, resolve_student_checkpoint
 from slim_stereo import PRESETS, SlimDEFOM, load_slim
 from teacher_labels import label_path, read_label
 
@@ -85,6 +87,16 @@ class LabelledPairs(Dataset):
                 left = (left * alpha + beta).clamp(0, 255)
                 right = (right * alpha + beta).clamp(0, 255)
         return left.contiguous(), right.contiguous(), label.contiguous()
+
+
+def encoder_student(path):
+    """The MobileViT encoder student of a slim checkpoint (its stereo core is dropped), or a
+    student-only checkpoint. Returns (student, checkpoint dict with student_cfg/out_dim, path)."""
+    ck = torch.load(str(resolve_student_checkpoint(path)), map_location="cpu", weights_only=True)
+    if "slim" not in ck:
+        return load_student(path, "cpu")
+    model, ck, src = load_slim(path, "cpu")
+    return model.defomencoder.depth_anything, ck, src
 
 
 def sequence_loss(predictions, label, gamma):
@@ -135,6 +147,7 @@ def main():
     ap.add_argument("--config", required=True)
     ap.add_argument("--epochs", type=int, default=0)
     ap.add_argument("--resume_from", default=None, help="this run's folder or a slim checkpoint")
+    ap.add_argument("--max_steps", type=int, default=0, help="stop each epoch after N steps (smoke test)")
     args = ap.parse_args()
 
     portable_cfg = load_config(args.config)
@@ -143,10 +156,6 @@ def main():
     if args.resume_from is not None:
         portable_cfg["paths"]["resume_from"] = args.resume_from
     cfg = resolve_paths(portable_cfg)
-    for key in ("labels_dir", "student_ckpt"):
-        value = cfg["paths"].get(key, "")
-        if value and not Path(value).is_absolute():
-            cfg["paths"][key] = str(Path(value).resolve() if Path(value).exists() else ROOT / value)
     t = cfg["training"]
     preset = cfg["slim"]["preset"]
     torch.manual_seed(t["seed"]); random.seed(t["seed"]); np.random.seed(t["seed"])
@@ -171,9 +180,9 @@ def main():
         raise SystemExit("fewer training frames than one batch")
     val_sets = collections.OrderedDict()
     for source in sorted(set(source_of[p] for p in val_paths)):
-        items = [p for p in val_paths if source_of[p] == source]
-        val_sets[source] = items[::max(1, len(items) // t["val_max_frames"])][:t["val_max_frames"]]
-    print("Training %d frames (%d steps/epoch), validating %s" % (len(train_paths), len(loader),
+        val_sets[source] = subsample([p for p in val_paths if source_of[p] == source], t["val_max_frames"])
+    steps_per_epoch = min(len(loader), args.max_steps) if args.max_steps else len(loader)
+    print("Training %d frames (%d steps/epoch), validating %s" % (len(train_paths), steps_per_epoch,
                                                                 {k: len(v) for k, v in val_sets.items()}))
 
     # ---- model
@@ -186,13 +195,13 @@ def main():
         student_cfg, out_dim = ck["student_cfg"], ck["out_dim"]
         print("%s from %s (epoch %s)" % ("Resuming" if resume else "Fine-tuning", src, ck.get("epoch")))
     else:
-        student, sck, src = load_student(cfg["paths"]["student_ckpt"], "cpu")
+        student, sck, src = encoder_student(cfg["paths"]["student_ckpt"])
         if abs(student.input_scale - PRESETS[preset]["student_scale"]) > 1e-6:
-            raise SystemExit("stage-1 student %s was trained at input_scale %s; preset %s needs %s"
+            raise SystemExit("student %s was trained at input_scale %s; preset %s needs %s"
                              % (src, student.input_scale, preset, PRESETS[preset]["student_scale"]))
         model = SlimDEFOM(cfg["arch"], PRESETS[preset], student)
         student_cfg, out_dim = dict(sck["student_cfg"], input_scale=student.input_scale), sck["out_dim"]
-        print("Slim %s with stage-1 student %s (epoch %s); stereo core freshly initialised" % (preset, src, sck.get("epoch")))
+        print("Slim %s with student %s (epoch %s); stereo core freshly initialised" % (preset, src, sck.get("epoch")))
     model.to(device)
     model.mixed_precision = bool(t["amp"]) and device.type == "cuda"
     student = model.defomencoder.depth_anything
@@ -207,11 +216,11 @@ def main():
                                                "" if t["freeze_student"] else " + student (lr %g)" % t["student_lr"]))
 
     optimizer = torch.optim.AdamW(groups, weight_decay=t["weight_decay"])
-    total_steps = t["epochs"] * len(loader)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=[g["lr"] for g in groups],
-                                                    total_steps=total_steps, pct_start=0.05,
-                                                    anneal_strategy="cos",
-                                                    final_div_factor=t["lr"] / 25.0 / t["min_lr"])   # ends at min_lr
+    total_steps = t["epochs"] * steps_per_epoch
+    schedule = dict(max_lr=[g["lr"] for g in groups], total_steps=total_steps,
+                    pct_start=min(0.5, max(0.05, 3.0 / total_steps)), anneal_strategy="cos",
+                    final_div_factor=t["lr"] / 25.0 / t["min_lr"])                      # ends at min_lr
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, **schedule)
     scaler = torch.amp.GradScaler("cuda", enabled=model.mixed_precision)
     start_epoch = 0
     if resume:
@@ -221,14 +230,10 @@ def main():
         start_epoch = ck["epoch"] + 1
         # Rebuild the one-cycle schedule for this run's length (it may have
         # more epochs) and continue from the step already reached.
-        done = start_epoch * len(loader)
+        done = start_epoch * steps_per_epoch
         if done >= total_steps:
             raise SystemExit("already trained %d epochs; pass --epochs > %d" % (start_epoch, start_epoch))
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=[g["lr"] for g in groups],
-                                                        total_steps=total_steps, pct_start=0.05,
-                                                        anneal_strategy="cos",
-                                                        final_div_factor=t["lr"] / 25.0 / t["min_lr"],
-                                                        last_epoch=done - 1)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, last_epoch=done - 1, **schedule)
 
     # ---- best checkpoint, comparable only on the same frames and iterations
     signature = hashlib.sha1(json.dumps({"frames": sorted(str(p) for v in val_sets.values() for p in v),
@@ -272,6 +277,8 @@ def main():
             student.eval()
         started, running, n = time.time(), collections.Counter(), 0
         for step, (left, right, label) in enumerate(loader):
+            if step >= steps_per_epoch:
+                break
             left, right, label = left.to(device), right.to(device), label.to(device)
             optimizer.zero_grad(set_to_none=True)
             predictions = model(left, right, iters=t["iters"], scale_iters=t["scale_iters"])
@@ -286,7 +293,7 @@ def main():
             running.update({"loss": float(loss.detach()), "epe": m["epe"], "within3": m["within3"]})
             if (step + 1) % 50 == 0:
                 print("  epoch %d step %d/%d  loss %.3f  EPE %.2f px  within3 %.1f%%  lr %.2e  (%.2f s/step)"
-                      % (epoch, step + 1, len(loader), running["loss"] / n, running["epe"] / n,
+                      % (epoch, step + 1, steps_per_epoch, running["loss"] / n, running["epe"] / n,
                          100 * running["within3"] / n, scheduler.get_last_lr()[0], (time.time() - started) / n),
                       flush=True)
         record = {"epoch": epoch, "lr": scheduler.get_last_lr()[0], "seconds": round(time.time() - started, 1)}

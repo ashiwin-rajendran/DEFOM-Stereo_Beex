@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
-"""Evaluate distilled students against the teacher: metrics, charts, report.
+"""Evaluate models against the DEFOM ViT-L teacher: metrics, charts, report.
 
     python3 distillation/evaluate.py \\
-        --models student=distillation/checkpoints/underwater_vitl_middlebury_to_student_multiscale \\
-                 v9=distillation/checkpoints/slim_v9 \\
-                 v9_joint=distillation/checkpoints/slim_v9_joint \\
-        --out distillation/evaluations/<date>_slim_v9_joint
+        --models slim_v9=distillation/3_checkpoints/1_slim_model \\
+                 vits_s2=distillation/3_checkpoints/2_fast_vits_model@10/4 \\
+                 new=distillation/3_checkpoints/slim_v9_finetune \\
+        --long_sides 512 800 --out distillation/4_evaluations/<date>_<name>
 
-    # the same student at fewer refinement iterations (name=path@iters/scale_iters):
-    python3 distillation/evaluate.py --models it24=<run>@24/8 it16=<run>@16/6 it12=<run>@12/4
+    # one model at other refinement iterations (name=path@iters/scale_iters):
+    python3 distillation/evaluate.py --models it12=<run>@12/4 it8=<run>@8/4
 
-A run folder picks its student_best.pth. The teacher always runs at
---iters/--scale_iters (default: the checkpoints' own, 32/8); a student without
-@ uses the same, a slim DEFOM its own training iterations.
+A run folder picks its student_best.pth. The teacher (--teacher, ViT-L) runs at
+--iters/--scale_iters (default 32/8); a model without @ at its own training
+iterations.
 
-Every model runs end to end -- a student inside the teacher's own stereo core,
-a slim DEFOM as is -- on the held-out frames of the training split (so nothing
-it trained on), and is compared pixel by pixel against the full teacher. That
-is the question that matters for deployment: how closely does the small model
-reproduce the 1530 MB one?
+Every model runs end to end on the held-out frames of the training split (so
+nothing it trained on), or on every frame of --image_dir (--frames all), and is
+compared pixel by pixel against the teacher.
 
 Robustness:
   * every number has a bootstrap 95% confidence interval over frames;
@@ -43,9 +41,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "core"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import argparse
@@ -59,11 +54,10 @@ import cv2
 import numpy as np
 import torch
 
+from common import DEFOM_ARCH, ROOT, StereoPairDataset, discover_images, load_config, resolve_paths, split_sessions
 from core.defom_stereo import DEFOMStereo
 from core.utils.utils import InputPadder
-from defom_student import load_student, resolve_student_checkpoint
 from slim_stereo import load_slim
-from distill_defom import StereoPairDataset, discover_images, load_config, resolve_paths, split_sessions
 
 # Relative-depth-error bands, by disparity as a fraction of image width:
 # camera-independent "nearness" (depth ~ 1 / disparity).
@@ -104,7 +98,7 @@ def parse_models(specs):
 def select_frames(cfg, frames, max_frames):
     """{source: evenly spaced frame paths}. 'heldout' uses exactly the
     trainer's per-session validation split; 'all' takes every frame under
-    image_dir (e.g. a new dive the student never saw)."""
+    image_dir (e.g. a new dive no model trained on)."""
     paths = discover_images(cfg["paths"]["image_dir"])
     if frames == "heldout":
         _, pool, source_of = split_sessions(paths, cfg)
@@ -133,10 +127,10 @@ def texture_mask(left):
 # --------------------------------------------------------------------------
 
 
-def frame_metrics(student, teacher, textured):
-    """Per-frame agreement of one student disparity map with the teacher's."""
-    finite = np.isfinite(student)
-    err = np.where(finite, np.abs(student - teacher), np.inf)
+def frame_metrics(pred, teacher, textured):
+    """Per-frame agreement of one model's disparity map with the teacher's."""
+    finite = np.isfinite(pred)
+    err = np.where(finite, np.abs(pred - teacher), np.inf)
     rel = err / np.maximum(teacher, 1e-3)
     out = {
         "within1": float((err < 1).mean()),
@@ -159,36 +153,19 @@ def frame_metrics(student, teacher, textured):
 def run(args, models, cfg, sets, device):
     loaded = collections.OrderedDict()
     for name, (path, model_iters) in models.items():
-        if "slim" in torch.load(str(resolve_student_checkpoint(path)), map_location="cpu", weights_only=True):
-            # A slim DEFOM (train_slim.py) is a whole stereo model: it runs as is,
-            # by default at the iterations it was trained with.
-            slim, ck, resolved = load_slim(path, device)
-            own = (ck["config"]["training"]["iters"], ck["config"]["training"]["scale_iters"])
-            loaded[name] = {"slim": slim, "ck": ck, "path": str(resolved), "iters": model_iters or own}
-        else:
-            student, ck, resolved = load_student(path, device)
-            loaded[name] = {"student": student, "ck": ck, "path": str(resolved), "iters": model_iters}
-    def teacher_of(ck):
-        path = Path(ck["config"]["paths"]["teacher_ckpt"])
-        return (path if path.is_absolute() else ROOT / path).resolve()
-
-    first = next(iter(loaded.values()))["ck"]
-    teacher_ckpt = teacher_of(first)
-    for name, item in loaded.items():
-        if teacher_of(item["ck"]) != teacher_ckpt or item["ck"]["config"]["arch"] != first["config"]["arch"]:
-            raise SystemExit("%s was distilled against a different stereo core (%s) than %s (%s). "
-                             "Evaluate them separately." % (name, teacher_of(item["ck"]), next(iter(loaded)), teacher_ckpt))
+        # A whole stereo model (slim v9, ViT-S s2), by default at the iterations it was trained with.
+        net, ck, resolved = load_slim(path, device)
+        own = (ck["config"]["training"]["iters"], ck["config"]["training"]["scale_iters"])
+        loaded[name] = {"net": net, "ck": ck, "path": str(resolved), "iters": model_iters or own}
+    teacher_ckpt = Path(args.teacher if Path(args.teacher).is_absolute() else ROOT / args.teacher).resolve()
     print("Teacher / stereo core: %s" % teacher_ckpt)
-    model = DEFOMStereo(argparse.Namespace(**first["config"]["arch"]))
+    model = DEFOMStereo(argparse.Namespace(**DEFOM_ARCH))
     state = torch.load(str(teacher_ckpt), map_location="cpu", weights_only=True)
     model.load_state_dict(state["model"] if "model" in state else state)
     del state
     model.to(device).eval()
-    teacher_encoder = model.defomencoder.depth_anything
-    iters = args.iters or first["config"]["arch"]["valid_iters"]
-    scale_iters = args.scale_iters or first["config"]["arch"]["scale_iters"]
-    for item in loaded.values():
-        item["iters"] = item["iters"] or (iters, scale_iters)
+    iters = args.iters or DEFOM_ARCH["valid_iters"]
+    scale_iters = args.scale_iters or DEFOM_ARCH["scale_iters"]
 
     per_frame = collections.defaultdict(list)    # (model, source, L) -> [metrics dict]
     near = collections.defaultdict(list)         # (model, source) -> [(nearness, rel)]
@@ -197,62 +174,55 @@ def run(args, models, cfg, sets, device):
     skipped = 0
     rng = np.random.default_rng(args.seed)
 
-    def disparity(encoder, lp, rp, padder, n_iters, net=None):
-        """The teacher's stereo core with `encoder`, or a whole slim model `net`."""
-        if net is None:
-            model.defomencoder.depth_anything = encoder
+    def disparity(net, lp, rp, padder, n_iters):
         if device.type == "cuda":
             torch.cuda.synchronize()
         started = time.time()
         with torch.no_grad():
-            out = padder.unpad((net or model)(lp, rp, iters=n_iters[0], scale_iters=n_iters[1], test_mode=True))
+            out = padder.unpad(net(lp, rp, iters=n_iters[0], scale_iters=n_iters[1], test_mode=True))
         if device.type == "cuda":
             torch.cuda.synchronize()
         return out[0, 0].float().cpu().numpy(), 1000.0 * (time.time() - started)
 
-    try:
-        for source, items in sets.items():
-            sample_idx = set(np.linspace(0, len(items) - 1, min(args.samples, len(items))).round().astype(int))
-            for long_side in args.long_sides:
-                data = StereoPairDataset(items, cfg, long_side=long_side)
-                for index in range(len(data)):
-                    try:
-                        left, right = data[index]
-                    except RuntimeError as exc:
-                        print("  skip unreadable %s (%s)" % (items[index], exc))
-                        skipped += 1
-                        continue
-                    textured = texture_mask(left)
-                    lp, rp = left[None].to(device), right[None].to(device)
-                    padder = InputPadder(lp.shape, divis_by=32)
-                    lp, rp = padder.pad(lp, rp)
-                    try:
-                        teacher, _ = disparity(teacher_encoder, lp, rp, padder, (iters, scale_iters))
-                        results = {name: disparity(item.get("student"), lp, rp, padder, item["iters"],
-                                                   net=item.get("slim"))
-                                   for name, item in loaded.items()}
-                    except torch.cuda.OutOfMemoryError:
-                        torch.cuda.empty_cache()
-                        print("  skip %s @%d: CUDA OOM (dropped for every model)" % (items[index].name, long_side))
-                        skipped += 1
-                        continue
-                    width = teacher.shape[1]
-                    pick = rng.choice(teacher.size, size=min(PIXELS_PER_FRAME, teacher.size), replace=False)
-                    nearness = (teacher.ravel() / width)[pick]
-                    for name, (disp, ms) in results.items():
-                        metrics, rel = frame_metrics(disp, teacher, textured)
-                        per_frame[(name, source, long_side)].append(metrics)
-                        near[(name, source)].append(np.stack([nearness, rel.ravel()[pick]], 1))
-                        timing[(name, long_side)].append(ms)
-                    if long_side == max(args.long_sides) and index in sample_idx:
-                        rgb = left.permute(1, 2, 0).numpy().astype(np.uint8)
-                        samples[source].append((cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), teacher,
-                                                {n: r[0] for n, r in results.items()}))
-                print("  %-10s @%4d: %d frames" % (source, long_side,
-                                                   len(per_frame[(next(iter(loaded)), source, long_side)])))
-    finally:
-        model.defomencoder.depth_anything = teacher_encoder
-    meta = {"teacher_ckpt": str(first["config"]["paths"]["teacher_ckpt"]), "iters": iters,
+    for source, items in sets.items():
+        sample_idx = set(np.linspace(0, len(items) - 1, min(args.samples, len(items))).round().astype(int))
+        for long_side in args.long_sides:
+            data = StereoPairDataset(items, cfg, long_side=long_side)
+            for index in range(len(data)):
+                try:
+                    left, right = data[index]
+                except RuntimeError as exc:
+                    print("  skip unreadable %s (%s)" % (items[index], exc))
+                    skipped += 1
+                    continue
+                textured = texture_mask(left)
+                lp, rp = left[None].to(device), right[None].to(device)
+                padder = InputPadder(lp.shape, divis_by=32)
+                lp, rp = padder.pad(lp, rp)
+                try:
+                    teacher, _ = disparity(model, lp, rp, padder, (iters, scale_iters))
+                    results = {name: disparity(item["net"], lp, rp, padder, item["iters"])
+                               for name, item in loaded.items()}
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    print("  skip %s @%d: CUDA OOM (dropped for every model)" % (items[index].name, long_side))
+                    skipped += 1
+                    continue
+                width = teacher.shape[1]
+                pick = rng.choice(teacher.size, size=min(PIXELS_PER_FRAME, teacher.size), replace=False)
+                nearness = (teacher.ravel() / width)[pick]
+                for name, (disp, ms) in results.items():
+                    metrics, rel = frame_metrics(disp, teacher, textured)
+                    per_frame[(name, source, long_side)].append(metrics)
+                    near[(name, source)].append(np.stack([nearness, rel.ravel()[pick]], 1))
+                    timing[(name, long_side)].append(ms)
+                if long_side == max(args.long_sides) and index in sample_idx:
+                    rgb = left.permute(1, 2, 0).numpy().astype(np.uint8)
+                    samples[source].append((cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), teacher,
+                                            {n: r[0] for n, r in results.items()}))
+            print("  %-10s @%4d: %d frames" % (source, long_side,
+                                               len(per_frame[(next(iter(loaded)), source, long_side)])))
+    meta = {"teacher_ckpt": str(teacher_ckpt), "iters": iters,
             "scale_iters": scale_iters, "skipped": skipped,
             "models": {n: {"path": i["path"], "epoch": i["ck"].get("epoch"), "iters": list(i["iters"]),
                            "val_score": i["ck"].get("val_score")} for n, i in loaded.items()}}
@@ -421,22 +391,17 @@ def charts(out, models, lines, table, bands, sources, run_logs):
     from matplotlib.ticker import MaxNLocator
     for run_name, (rows, best_info) in run_logs.items():
         epochs = [int(r["epoch"]) for r in rows]
-        keys = [k for k in rows[0] if k.startswith("val_") and k.endswith("_within3")]
+        # per-set validation columns: val_<camera>_within3 (train_slim.py), heldout_/probe_<set>_within3 (train_vits.py)
+        keys = [k for k in rows[0] if k.endswith("_within3") and k != "within3"]
         fig, axes = plt.subplots(1, 2, figsize=(14, 4.2))
-        axes[0].plot(epochs, [as_float(r.get("total")) for r in rows], "k-")
-        axes[0].set_title("%s: training loss (feature matching)" % run_name)
+        axes[0].plot(epochs, [as_float(r.get("loss")) for r in rows], "k-")
+        axes[0].set_title("%s: training loss" % run_name)
         axes[0].set_xlabel("epoch")
         axes[0].xaxis.set_major_locator(MaxNLocator(integer=True))
         axes[0].grid(alpha=0.3)
         for k in keys:
             vals = [100 * as_float(r.get(k)) for r in rows]
-            # val_<camera>_L<size>_within3 (distill_defom.py) or val_<camera>_within3 (train_slim.py)
-            source, sep, long_side = k[4:-8].rpartition("_L")
-            if not sep or not long_side.isdigit():
-                source, long_side = k[4:-8], ""
-            label = (line_label((source, int(long_side))) if long_side
-                     else line_label((source, 0)).split(" @")[0])
-            axes[1].plot(epochs, vals, "-", alpha=0.6, label=label.replace("\n", " "))
+            axes[1].plot(epochs, vals, "-", alpha=0.6, label=k[:-len("_within3")].replace("val_", ""))
         # Same score the trainer selects by; NaN for epochs without validation.
         mean = [np.mean([100 * as_float(r.get(k)) for k in keys]) for r in rows]
         axes[1].plot(epochs, mean, "k-", linewidth=2, label="mean (selection score)")
@@ -546,7 +511,7 @@ def write_outputs(out, models, lines, table, overall, paired, bands, timing, met
     big = max(args.long_sides)
     L = []
     L.append("# Model evaluation\n")
-    L.append("%s. Every model runs end to end (a student inside the stereo core, or a slim DEFOM) on frames it never "
+    L.append("%s. Every model runs end to end on frames it never "
              "trained on, compared pixel by pixel with the full teacher (`%s`, %d iterations)."
              % (time.strftime("%Y-%m-%d %H:%M"), meta["teacher_ckpt"], meta["iters"]))
     L.append("")
@@ -654,15 +619,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--models", nargs="+", required=True,
                     help="name=checkpoint or checkpoint; a directory picks its student_best.pth, else latest epoch")
-    ap.add_argument("--out", default="", help="output folder (default distillation/evaluations/<timestamp>)")
-    ap.add_argument("--config", default=str(ROOT / "distillation/configs/underwater_vitl.yaml"),
+    ap.add_argument("--out", default="", help="output folder (default distillation/4_evaluations/<timestamp>)")
+    ap.add_argument("--config", default=str(ROOT / "distillation/2_configs/slim_v9_2_finetune.yaml"),
                     help="training config: dataset location and the held-out split")
+    ap.add_argument("--teacher", default="checkpoints/defomstereo_vitl_middlebury.pth",
+                    help="the reference model (DEFOM release)")
     ap.add_argument("--image_dir", default="", help="evaluate on another dataset folder instead")
     ap.add_argument("--frames", default="heldout", choices=["heldout", "all"],
                     help="heldout: the training split's validation frames; all: every frame (new data)")
     ap.add_argument("--max_frames", type=int, default=80, help="per source (camera), evenly spaced")
     ap.add_argument("--long_sides", type=int, nargs="+", default=[512, 640])
-    ap.add_argument("--iters", type=int, default=0, help="teacher (and models without @); default: the checkpoints' own valid_iters")
+    ap.add_argument("--iters", type=int, default=0, help="teacher iterations; default 32")
     ap.add_argument("--scale_iters", type=int, default=0)
     ap.add_argument("--reference", default="", help="model the others are compared to (default: first)")
     ap.add_argument("--samples", type=int, default=3, help="sample frames per source in the images")
@@ -683,7 +650,7 @@ def main():
     if not args.no_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-    out = Path(args.out) if args.out else ROOT / "distillation/evaluations" / time.strftime("%Y%m%d_%H%M%S")
+    out = Path(args.out) if args.out else ROOT / "distillation/4_evaluations" / time.strftime("%Y%m%d_%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
 
     print("Selecting frames:")

@@ -1,0 +1,59 @@
+# Fast ViT-S DEFOM (vits_s2, 512x384, 6.05 Hz on the Orin NX), fine-tune.
+# The deployed model needs no training: slim_stereo.py --make vits_s2 builds it from the ViT-S
+# release. This fine-tunes it on DEFOM ViT-L's disparity (the same labels as slim v9) while
+# anchoring its internal outputs to the ViT-S release, which keeps it general.
+#
+#   python3 distillation/teacher_labels.py --config distillation/2_configs/vits_s2_finetune.yaml   # new frames only
+#   python3 -u distillation/train_vits.py  --config distillation/2_configs/vits_s2_finetune.yaml
+#
+# Untested beyond a smoke run: retraining the GRU on our dives alone lost accuracy in the
+# tank and the lab, so watch the probe sets; the release's own score is printed as the bar.
+# ~1 h/epoch on an RTX 4070 over 11k frames; ~11 GB of GPU memory at batch 4.
+
+run_name: vits_s2_finetune
+description: >
+  DEFOM ViT-S release with fnet/cnet from 1/2 resolution, fine-tuned towards DEFOM ViT-L.
+
+paths:
+  image_dir: distillation/1_datasets/underwater
+  probe_dir: distillation/1_datasets/probe                # new scenes, validation only (never trained on)
+  teacher_ckpt: checkpoints/defomstereo_vitl_middlebury.pth   # the labels' teacher and the validation reference
+  release_ckpt: checkpoints/defomstereo_vits_rvc.pth   # the frozen anchor (internal loss)
+  labels_dir: distillation/1_datasets/teacher_labels_800
+  checkpoint_dir: distillation/3_checkpoints/vits_s2_finetune
+  init_from: distillation/3_checkpoints/2_fast_vits_model   # deployed model; empty = the release's weights
+  resume_from: ""
+
+vits:
+  preset: vits_s2
+
+training:
+  epochs: 3
+  batch_size: 4
+  lr: 0.00002                 # gentle: everything is pretrained
+  encoder_lr_factor: 0.1      # Depth Anything parts, if listed in train
+  min_lr: 0.000001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  train: [fnet., cnet.]       # the image branch (its stem changed). Add context_zqr_convs., update_block.,
+                              # scale_update_block. only with data beyond our dives, and check the probe sets
+  iters: 10                   # as deployed
+  scale_iters: 4
+  gamma: 0.9
+  amp: true                   # bf16 where supported
+  tf32: true
+  val_every: 1
+  val_max_frames: 40          # per set
+  val_long_side: 512          # deployment size
+
+loss:
+  w_fmap: 1.0                 # internal outputs vs the release (relative MSE)
+  w_net: 1.0
+  w_inp: 1.0
+  w_idepth: 1.0
+  w_disp: 0.05                # L1 (px) to ViT-L's disparity; small: the anchor leads
+
+data:
+  label_long_side: 800
+  crop: [320, 448]            # around the deployed 512x384
+  scale_jitter: [0.6, 1.2]
