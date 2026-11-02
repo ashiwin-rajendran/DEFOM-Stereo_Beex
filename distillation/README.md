@@ -65,6 +65,7 @@ distillation/                  the folders are numbered in workflow order
       defom_svc/                   defom_svc.cpp (SVC: cameras -> engine -> UDP), defom_receiver.py (AIB -> ROS)
   7_ros_tools/                 PC, ROS Noetic
       capture_stereo.py            record training frames from a ROS stereo topic
+      capture_public_stereo.py     the same from separate left / right camera topics (public bags), rectified
       compare_beex_bags.py         any model on DWE / Voyis recordings, next to the camera's own depth
       compare_public_bags.py       the same for public stereo bags (separate, unrectified cameras)
   8_results/
@@ -137,6 +138,10 @@ python3 distillation/7_ros_tools/capture_stereo.py --out distillation/1_datasets
 rosbag play --topics /ikan/voyis/stereo_concatenated/compressed -- <dive>.beex        # Voyis
 python3 distillation/7_ros_tools/capture_stereo.py --out distillation/1_datasets/underwater \
     --topic /ikan/voyis/stereo_concatenated/compressed --session voyis_dive3
+
+rosbag play bus_outside.bag                                                            # public bag
+python3 distillation/7_ros_tools/capture_public_stereo.py --out distillation/1_datasets/public \
+    --left /slave1/image_raw/compressed --right /slave2/image_raw/compressed --session bus_outside
 ```
 
 - **Format:** one folder per session of **rectified, side-by-side** frames (left | right), any
@@ -144,6 +149,13 @@ python3 distillation/7_ros_tools/capture_stereo.py --out distillation/1_datasets
   the same way: one folder per sequence.
 - **Topics:** any stereo topic the compare tools read works: DWE `DepthImage`, side-by-side
   `CompressedImage` / `Image`, `StereoImage`.
+- **Public bags** (one raw topic per camera, e.g. `cemetery.bag`, `bus_outside.bag`):
+  `capture_public_stereo.py` pairs the two cameras by stamp (`--max_dt` 0.02 s), rectifies them
+  from `<topic>/cam_info` to `--width` (800, i.e. 800x600 per eye) and saves the same
+  side-by-side sessions. The left camera is the one whose `P[0,3]` is 0; swapped topics are
+  refused. `--no_rectify` for bags that are already rectified. Keep public data in its own folder
+  (`1_datasets/public`) unless it is meant to be trained on with the dives: the configs' `image_dir`
+  takes every session under it.
 - **Recording behaviour:** near-duplicates are skipped (`--min_mad 2.0`), so record while
   moving. It stops at `--max_frames` (4000). Reusing `--session` appends to it.
 - **Validation split:** the last 5% of every session is held out.
